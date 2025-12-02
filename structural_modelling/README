@@ -1,0 +1,17 @@
+
+Automated MODELLER loop modeling workflow.
+This script:
+  1. Prompts for a PDB ID
+  2. Runs prepare_modeller_from_pdb.py to download and prepare inputs
+  3. Runs model_loops.py to generate loop models
+  4. Organizes all outputs into a folder named by the PDB ID
+
+Usage:
+  ./run_modeller.sh
+  ./run_modeller.sh 8WU1   # Can also pass PDB ID as argument
+
+Requirements:
+  - Python 3
+  - MODELLER (with license configured)
+  - requests module (pip install requests)
+
