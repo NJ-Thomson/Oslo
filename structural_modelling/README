@@ -13,5 +13,11 @@ Usage:
 Requirements:
   - Python 3
   - MODELLER (with license configured)
-  - requests module (pip install requests)
+    * Download from https://salilab.org/modeller/
+    * License key required (free for academic use)
+    * Must be properly installed and importable in Python
+  - Python packages:
+    * modeller (included with MODELLER installation, required for model_loops.py)
+    * requests (pip install requests, required for prepare_modeller_from_pdb.py)
+    * Standard library: sys, os, collections
 
