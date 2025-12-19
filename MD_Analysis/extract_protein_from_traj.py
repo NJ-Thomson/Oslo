@@ -4,7 +4,7 @@ Interactive protein extraction from MD trajectories.
 
 import MDAnalysis as mda
 import numpy as np
-fromt tqdm import tqdm
+from tqdm import tqdm
 
 def extract_gpcr_interactive():
     """Interactively extract a protein chain from an MD trajectory."""
