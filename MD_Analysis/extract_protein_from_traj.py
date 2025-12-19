@@ -4,7 +4,7 @@ Interactive protein extraction from MD trajectories.
 
 import MDAnalysis as mda
 import numpy as np
-
+fromt tqdm import tqdm
 
 def extract_gpcr_interactive():
     """Interactively extract a protein chain from an MD trajectory."""
@@ -69,7 +69,7 @@ def extract_gpcr_interactive():
     if trajectory:
         out_traj = input(f"Output trajectory [{default_traj}]: ").strip() or default_traj
         with mda.Writer(out_traj, gpcr.n_atoms) as W:
-            for ts in u.trajectory:
+            for ts in tqdm(u.trajectory, desc="Writing trajectory"):
                 W.write(gpcr)
         print(f"Wrote: {out_traj}")
     
