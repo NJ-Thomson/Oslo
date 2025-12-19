@@ -4,7 +4,7 @@ Supports both CLI arguments (for SLURM) and interactive mode.
 
 Usage examples:
 # CLI - full example
-python extract_gpcr.py \
+python extract_protein_from_traj.py \
     -f system.gro \
     -x md.xtc \
     -c 1 \
@@ -12,16 +12,16 @@ python extract_gpcr.py \
     -ot gpcr_only.xtc
 
 # Interactive
-python extract_gpcr.py -i
+python extract_protein_from_traj.py -i
 
 # CLI - by chain number
-python extract_gpcr.py -f system.gro -x md.xtc -c 1
+python extract_protein_from_traj.py -f system.gro -x md.xtc -c 1
 
 # CLI - custom selection
-python extract_gpcr.py -f system.gro -x md.xtc -s "protein and resid 13:318"
+python extract_protein_from_traj.py -f system.gro -x md.xtc -s "protein and resid 13:318"
 
 # Structure only
-python extract_gpcr.py -f system.gro -c 1 -os receptor.gro
+python extract_protein_from_traj.py -f system.gro -c 1 -os receptor.gro
 """
 
 import MDAnalysis as mda
