@@ -1,27 +1,7 @@
+#!/usr/bin/env python3
 """
 GPCR extraction from MD trajectories.
 Supports both CLI arguments (for SLURM) and interactive mode.
-
-Usage examples:
-# CLI - full example
-python extract_protein_from_traj.py \
-    -f system.gro \
-    -x md.xtc \
-    -c 1 \
-    -os gpcr_only.gro \
-    -ot gpcr_only.xtc
-
-# Interactive
-python extract_protein_from_traj.py -i
-
-# CLI - by chain number
-python extract_protein_from_traj.py -f system.gro -x md.xtc -c 1
-
-# CLI - custom selection
-python extract_protein_from_traj.py -f system.gro -x md.xtc -s "protein and resid 13:318"
-
-# Structure only
-python extract_protein_from_traj.py -f system.gro -c 1 -os receptor.gro
 """
 
 import MDAnalysis as mda
@@ -34,16 +14,23 @@ import argparse
 
 
 def detect_chains(protein):
-    """Detect protein chains based on residue numbering."""
-    resids = protein.residues.resids
-    diffs = np.diff(resids)
-    breaks = np.where((diffs > 30) | (diffs < 0))[0]
+    """Detect protein chains using MDAnalysis fragments (bond connectivity)."""
+    fragments = protein.fragments
     
-    if len(breaks) == 0:
-        chains = [(0, len(resids) - 1)]
-    else:
-        boundaries = [0] + list(breaks + 1) + [len(resids)]
-        chains = [(boundaries[i], boundaries[i + 1] - 1) for i in range(len(boundaries) - 1)]
+    chains = []
+    for frag in fragments:
+        prot_atoms = frag.select_atoms('protein')
+        if prot_atoms.n_atoms > 50:
+            residues = prot_atoms.residues
+            start_resid = residues[0].resid
+            end_resid = residues[-1].resid
+            chains.append({
+                'atoms': prot_atoms,
+                'residues': residues,
+                'start_resid': start_resid,
+                'end_resid': end_resid,
+                'n_residues': len(residues)
+            })
     
     return chains
 
@@ -57,7 +44,7 @@ def extract_gpcr(topology, trajectory=None, chain=None, selection=None,
     Parameters
     ----------
     topology : str
-        Topology file (.gro/.pdb/.tpr)
+        Topology file (.tpr required for bond connectivity)
     trajectory : str, optional
         Trajectory file (.xtc/.trr)
     chain : int, optional
@@ -87,26 +74,21 @@ def extract_gpcr(topology, trajectory=None, chain=None, selection=None,
     chains = detect_chains(protein)
     
     print(f"\nFound {len(chains)} protein chain(s):")
-    for i, (start_idx, end_idx) in enumerate(chains):
-        start_resid = protein.residues[start_idx].resid
-        end_resid = protein.residues[end_idx].resid
-        n_res = end_idx - start_idx + 1
-        print(f"  [{i + 1}] resid {start_resid}-{end_resid} ({n_res} residues)")
+    for i, ch in enumerate(chains):
+        print(f"  [{i + 1}] resid {ch['start_resid']}-{ch['end_resid']} ({ch['n_residues']} residues)")
     
     # Determine selection
     if selection:
         gpcr = u.select_atoms(selection)
     elif chain:
         if 1 <= chain <= len(chains):
-            start_idx, end_idx = chains[chain - 1]
-            gpcr = protein.residues[start_idx:end_idx + 1].atoms
+            gpcr = chains[chain - 1]['atoms']
         else:
             raise ValueError(f"Chain {chain} not found. Available: 1-{len(chains)}")
     elif interactive:
         choice = input("\nSelect chain number (or enter custom selection): ").strip()
         if choice.isdigit() and 1 <= int(choice) <= len(chains):
-            start_idx, end_idx = chains[int(choice) - 1]
-            gpcr = protein.residues[start_idx:end_idx + 1].atoms
+            gpcr = chains[int(choice) - 1]['atoms']
         else:
             gpcr = u.select_atoms(choice)
     else:
@@ -120,7 +102,7 @@ def extract_gpcr(topology, trajectory=None, chain=None, selection=None,
     
     # Write trajectory
     if trajectory:
-        gmx = shutil.which('gmx')
+        gmx = shutil.which('gmx_mpi')
         
         if gmx:
             print("Using GROMACS for fast trajectory extraction...")
@@ -161,18 +143,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Interactive mode
-  %(prog)s -i
+  # Interactive mode (default if no arguments)
+  %(prog)s
   
   # CLI mode for SLURM
-  %(prog)s -f system.gro -x md.xtc -c 1 -os gpcr.gro -ot gpcr.xtc
+  %(prog)s -f topol.tpr -x md.xtc -c 1 -os gpcr.gro -ot gpcr.xtc
   
   # Custom selection
-  %(prog)s -f system.gro -x md.xtc -s "protein and resid 13:318"
+  %(prog)s -f topol.tpr -x md.xtc -s "protein and resid 13:318"
+  
+Note: Requires .tpr topology for bond connectivity (fragment detection).
         """
     )
     
-    parser.add_argument('-f', '--topology', help='Topology file (.gro/.pdb/.tpr)')
+    parser.add_argument('-f', '--topology', help='Topology file (.tpr required)')
     parser.add_argument('-x', '--trajectory', help='Trajectory file (.xtc/.trr)')
     parser.add_argument('-c', '--chain', type=int, help='Chain number (1-indexed)')
     parser.add_argument('-s', '--selection', help='Custom MDAnalysis selection')
@@ -182,13 +166,13 @@ Examples:
     
     args = parser.parse_args()
     
-    # Full interactive mode
-    if args.interactive and not args.topology:
-        args.topology = input("Topology file (.gro/.pdb/.tpr): ").strip()
-        args.trajectory = input("Trajectory file (.xtc/.trr) or Enter for none: ").strip() or None
-    
+    # Default to interactive if no topology provided
     if not args.topology:
-        parser.error("Topology required. Use -f or -i for interactive mode.")
+        args.interactive = True
+        print("Topology file (.tpr required): ", end='', flush=True)
+        args.topology = input().strip()
+        print("Trajectory file (.xtc/.trr) or Enter for none: ", end='', flush=True)
+        args.trajectory = input().strip() or None
     
     extract_gpcr(
         topology=args.topology,
