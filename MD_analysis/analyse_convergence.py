@@ -12,6 +12,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
+import sys
+from datetime import datetime
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, 'w')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
 
 
 def load_repeats(base_dir='.', n_repeats=5, struct='gpcr_only.gro', traj='gpcr_only.xtc'):
@@ -151,7 +171,7 @@ def calculate_rg(universes, selection='protein'):
     return rg_data
 
 
-def plot_convergence(rmsd_data, rmsf_data, rg_data, output_prefix='convergence'):
+def plot_convergence(rmsd_data, rmsf_data, rg_data, output_prefix='convergence', output_dir='Analysis'):
     """
     Create convergence plots.
 
@@ -165,7 +185,14 @@ def plot_convergence(rmsd_data, rmsf_data, rg_data, output_prefix='convergence')
         Radius of gyration data for each repeat
     output_prefix : str
         Prefix for output files
+    output_dir : str
+        Directory to save output files
     """
+    # Create output directory if it doesn't exist
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    print(f"Output directory: {output_path.absolute()}")
+
     n_repeats = len(rmsd_data)
     colors = plt.cm.viridis(np.linspace(0, 1, n_repeats))
 
@@ -218,8 +245,9 @@ def plot_convergence(rmsd_data, rmsf_data, rg_data, output_prefix='convergence')
     ax.grid(alpha=0.3, axis='y')
 
     plt.tight_layout()
-    plt.savefig(f'{output_prefix}_analysis.png', dpi=300)
-    print(f"\nSaved plot: {output_prefix}_analysis.png")
+    plot_file = output_path / f'{output_prefix}_analysis.png'
+    plt.savefig(plot_file, dpi=300)
+    print(f"Saved plot: {plot_file}")
     plt.close()
 
 
@@ -372,31 +400,61 @@ Examples:
     parser.add_argument('-s', '--struct', default='gpcr_only.gro', help='Structure filename')
     parser.add_argument('-t', '--traj', default='gpcr_only.xtc', help='Trajectory filename')
     parser.add_argument('-o', '--output', default='convergence', help='Output prefix for plots')
+    parser.add_argument('--output-dir', default='Analysis', help='Output directory (default: Analysis)')
     parser.add_argument('--selection', default='protein and name CA', help='Selection for RMSD/RMSF')
 
     args = parser.parse_args()
 
-    print("Loading trajectories...")
-    universes = load_repeats(
-        base_dir=args.dir,
-        n_repeats=args.n_repeats,
-        struct=args.struct,
-        traj=args.traj
-    )
+    # Set up output directory and logging
+    output_path = Path(args.output_dir)
+    output_path.mkdir(exist_ok=True)
 
-    print("\nAnalyzing trajectories...")
-    rmsd_data = calculate_rmsd_matrix(universes, selection=args.selection)
-    rmsf_data = calculate_rmsf(universes, selection=args.selection)
-    rg_data = calculate_rg(universes, selection='protein')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = output_path / f'{args.output}_log_{timestamp}.txt'
 
-    print("\nGenerating plots...")
-    plot_convergence(rmsd_data, rmsf_data, rg_data, output_prefix=args.output)
+    # Redirect stdout to both terminal and log file
+    tee = Tee(log_file)
+    sys.stdout = tee
 
-    print("\nAssessing convergence...")
-    metrics = assess_convergence(rmsd_data, rmsf_data, rg_data)
-    print_convergence_report(metrics)
+    try:
+        print("="*60)
+        print("ENSEMBLE CONVERGENCE ANALYSIS")
+        print("="*60)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Log file: {log_file}")
+        print(f"Output directory: {output_path.absolute()}")
+        print("="*60)
 
-    print("Analysis complete!")
+        print("\nLoading trajectories...")
+        universes = load_repeats(
+            base_dir=args.dir,
+            n_repeats=args.n_repeats,
+            struct=args.struct,
+            traj=args.traj
+        )
+
+        print("\nAnalyzing trajectories...")
+        rmsd_data = calculate_rmsd_matrix(universes, selection=args.selection)
+        rmsf_data = calculate_rmsf(universes, selection=args.selection)
+        rg_data = calculate_rg(universes, selection='protein')
+
+        print("\nGenerating plots...")
+        plot_convergence(rmsd_data, rmsf_data, rg_data, output_prefix=args.output, output_dir=args.output_dir)
+
+        print("\nAssessing convergence...")
+        metrics = assess_convergence(rmsd_data, rmsf_data, rg_data)
+        print_convergence_report(metrics)
+
+        print("="*60)
+        print(f"Analysis complete: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"All outputs saved to: {output_path.absolute()}")
+        print("="*60)
+
+    finally:
+        # Restore stdout and close log file
+        sys.stdout = tee.terminal
+        tee.close()
+        print(f"\nLog saved to: {log_file}")
 
 
 if __name__ == '__main__':
