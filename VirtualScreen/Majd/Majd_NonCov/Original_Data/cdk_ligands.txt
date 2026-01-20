@@ -1,9 +1,0 @@
-# Ligand_name	SMILES
-Inhib_45	CN(c1cncc(-c2ccnc3[nH]ccc23)n1)C1CCNCC1
-Inhib_81	CN(c1ncnc2[nH]ccc12)C1CCCS(=O)(=O)C1
-Inhib_42	Cc1c[nH]c2nccc(-c3ccnc(N(C)C)c3)c12
-Inhib_89	CCc1c[nH]c2ncnc(N(C)Cc3ccccc3)c12
-Inhib_32	Brc1cncc2[nH]cc(-c3csc(-c4cc[nH]cn4)n3)c2c1
-Inhib_36	O=C1CCc2ccc(Nc3ncc(Br)cn3)cc2N1
-Inhib_78	CCNc1nc(-c2c[nH]c3ncc(Br)cc23)cs1
-Inhib_86	CC(=O)N(C)CCc1nc(-c2c[nH]c3ncc(Br)cc23)cs1
