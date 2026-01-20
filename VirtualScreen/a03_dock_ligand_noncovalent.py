@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""
+Simple AutoDock Vina Docking Script
+
+Docks a single ligand to a single receptor using a reference ligand for binding site.
+
+Usage:
+    python dock_ligand.py --ligand LIGAND.sdf --receptor RECEPTOR_predock.pdb \
+                          --reference REF.pdb --ligname LIGNAME
+
+Examples:
+    # Dock a single ligand
+    python dock_ligand.py --ligand conformers/Inhib_45.sdf \
+                          --receptor 4CXA_predock.pdb \
+                          --reference 4CXA_reference.pdb \
+                          --ligname LIG
+
+    # With custom output name
+    python dock_ligand.py --ligand conformers/Inhib_45.sdf \
+                          --receptor 4CXA_predock.pdb \
+                          --reference 4CXA_reference.pdb \
+                          --ligname LIG \
+                          --output docking_results/4CXA_Inhib_45
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import json
+import numpy as np
+from pathlib import Path
+
+
+def run_command(cmd, description, verbose=True):
+    """Execute a shell command and handle errors."""
+    if verbose:
+        print(f"  {description}...")
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"  ERROR: {description} failed!")
+        print(f"  STDERR: {result.stderr}")
+        return False
+    
+    if verbose:
+        print(f"  ✓ {description} complete")
+    return True
+
+
+def extract_binding_site(reference_pdb, ligand_name=None, padding=10.0, max_size=30.0):
+    """
+    Extract binding site coordinates from reference PDB with ligand.
+    
+    Args:
+        reference_pdb: Path to reference PDB with co-crystallized ligand
+        ligand_name: Residue name of ligand (e.g., 'LIG', '9GF')
+        padding: Buffer around ligand (Angstroms)
+        max_size: Maximum box dimension (Angstroms)
+    
+    Returns:
+        dict with center_x/y/z and size_x/y/z
+    """
+    exclude_list = {'HOH', 'WAT', 'TIP', 'TIP3', 'NA', 'CL', 'K', 'MG', 
+                    'CA', 'ZN', 'FE', 'MN', 'SO4', 'PO4', 'GOL', 'EDO',
+                    'ACE', 'NME', 'NH2'}
+    
+    print(f"\nExtracting binding site from: {reference_pdb}")
+    if ligand_name:
+        print(f"  Looking for ligand: {ligand_name}")
+    
+    with open(reference_pdb, 'r') as f:
+        lines = f.readlines()
+    
+    ligand_coords = []
+    ligand_residues = {}
+    
+    for line in lines:
+        if line.startswith("HETATM"):
+            resname = line[17:20].strip()
+            
+            if ligand_name and resname != ligand_name:
+                continue
+            if resname in exclude_list:
+                continue
+            
+            try:
+                x = float(line[30:38].strip())
+                y = float(line[38:46].strip())
+                z = float(line[46:54].strip())
+                ligand_coords.append([x, y, z])
+                
+                if resname not in ligand_residues:
+                    ligand_residues[resname] = 0
+                ligand_residues[resname] += 1
+            except:
+                pass
+    
+    if not ligand_coords:
+        print(f"  ERROR: No ligand found in reference!")
+        if ligand_name:
+            print(f"  Could not find '{ligand_name}'")
+        print(f"  Available HETATM residues:")
+        # Show what's available
+        available = set()
+        for line in lines:
+            if line.startswith("HETATM"):
+                resname = line[17:20].strip()
+                if resname not in exclude_list:
+                    available.add(resname)
+        print(f"    {', '.join(sorted(available)) if available else 'None'}")
+        sys.exit(1)
+    
+    print(f"  ✓ Found: {', '.join(f'{k} ({v} atoms)' for k, v in ligand_residues.items())}")
+    
+    ligand_coords = np.array(ligand_coords)
+    center = ligand_coords.mean(axis=0)
+    
+    # Calculate box size with padding
+    ligand_min = ligand_coords.min(axis=0)
+    ligand_max = ligand_coords.max(axis=0)
+    ligand_span = ligand_max - ligand_min
+    box_size = ligand_span + padding
+    box_size = np.minimum(box_size, max_size)  # Cap at max_size
+    
+    print(f"  Center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
+    print(f"  Box size: ({box_size[0]:.1f}, {box_size[1]:.1f}, {box_size[2]:.1f}) Å")
+    
+    return {
+        'center_x': float(center[0]),
+        'center_y': float(center[1]),
+        'center_z': float(center[2]),
+        'size_x': float(box_size[0]),
+        'size_y': float(box_size[1]),
+        'size_z': float(box_size[2])
+    }
+
+
+def prepare_ligand(sdf_file, output_pdbqt):
+    """Prepare ligand using Meeko."""
+    cmd = [
+        "mk_prepare_ligand.py",
+        "-i", str(sdf_file),
+        "-o", str(output_pdbqt)
+    ]
+    return run_command(cmd, "Preparing ligand with Meeko")
+
+
+def prepare_receptor(pdb_file, output_pdbqt):
+    """Prepare receptor using Open Babel."""
+    pdb_file = str(pdb_file)
+    output_pdbqt = str(output_pdbqt)
+    
+    # Add hydrogens
+    temp_pdb = pdb_file.replace('.pdb', '_temp_H.pdb')
+    cmd = ['obabel', pdb_file, '-O', temp_pdb, '-h']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"  ERROR adding hydrogens: {result.stderr}")
+        return False
+    
+    # Convert to PDBQT
+    cmd = ['obabel', temp_pdb, '-O', output_pdbqt, '-xr']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    # Clean up temp file
+    if Path(temp_pdb).exists():
+        Path(temp_pdb).unlink()
+    
+    if result.returncode != 0:
+        print(f"  ERROR creating PDBQT: {result.stderr}")
+        return False
+    
+    print(f"  ✓ Prepared receptor: {output_pdbqt}")
+    return True
+
+
+def run_vina(receptor_pdbqt, ligand_pdbqt, output_pdbqt, binding_site,
+             exhaustiveness=32, num_modes=20, energy_range=4.0):
+    """Run AutoDock Vina docking."""
+    
+    cmd = [
+        "vina",
+        "--receptor", str(receptor_pdbqt),
+        "--ligand", str(ligand_pdbqt),
+        "--out", str(output_pdbqt),
+        "--center_x", str(binding_site['center_x']),
+        "--center_y", str(binding_site['center_y']),
+        "--center_z", str(binding_site['center_z']),
+        "--size_x", str(binding_site['size_x']),
+        "--size_y", str(binding_site['size_y']),
+        "--size_z", str(binding_site['size_z']),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes", str(num_modes),
+        "--energy_range", str(energy_range)
+    ]
+    
+    print(f"\nRunning Vina (exhaustiveness={exhaustiveness})...")
+    print(f"  This may take a few minutes...")
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"  ERROR: Vina failed!")
+        print(f"  {result.stderr}")
+        return False
+    
+    print(f"  ✓ Docking complete")
+    return True
+
+
+def parse_vina_results(output_pdbqt):
+    """Parse docking results from Vina output PDBQT."""
+    results = []
+    
+    try:
+        with open(output_pdbqt, 'r') as f:
+            for line in f:
+                if line.startswith("REMARK VINA RESULT:"):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        try:
+                            affinity = float(parts[3])
+                            results.append({
+                                'mode': len(results) + 1,
+                                'affinity': affinity
+                            })
+                        except:
+                            pass
+    except Exception as e:
+        print(f"  Warning: Could not parse results: {e}")
+        return []
+    
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Dock a ligand to a receptor using AutoDock Vina",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument('--ligand', '-l', required=True,
+                        help='Ligand SDF file')
+    parser.add_argument('--receptor', '-r', required=True,
+                        help='Receptor PDB file (e.g., 4CXA_predock.pdb)')
+    parser.add_argument('--reference', '-ref', required=True,
+                        help='Reference PDB with co-crystallized ligand')
+    
+    # Optional arguments
+    parser.add_argument('--ligname', '-n', default=None,
+                        help='Ligand residue name in reference (e.g., LIG, 9GF)')
+    parser.add_argument('--output', '-o', default=None,
+                        help='Output prefix (default: receptor_ligand)')
+    parser.add_argument('--outdir', '-d', default='docking_results',
+                        help='Output directory (default: docking_results)')
+    
+    # Vina parameters
+    parser.add_argument('--exhaustiveness', '-e', type=int, default=32,
+                        help='Search exhaustiveness (default: 32)')
+    parser.add_argument('--num-modes', type=int, default=20,
+                        help='Number of poses to generate (default: 20)')
+    parser.add_argument('--energy-range', type=float, default=4.0,
+                        help='Energy range for poses in kcal/mol (default: 4.0)')
+    parser.add_argument('--padding', type=float, default=10.0,
+                        help='Box padding around ligand in Å (default: 10.0)')
+    
+    args = parser.parse_args()
+    
+    # Validate inputs
+    ligand_path = Path(args.ligand)
+    receptor_path = Path(args.receptor)
+    reference_path = Path(args.reference)
+    
+    if not ligand_path.exists():
+        print(f"ERROR: Ligand file not found: {args.ligand}")
+        sys.exit(1)
+    if not receptor_path.exists():
+        print(f"ERROR: Receptor file not found: {args.receptor}")
+        sys.exit(1)
+    if not reference_path.exists():
+        print(f"ERROR: Reference file not found: {args.reference}")
+        sys.exit(1)
+    
+    # Set up output
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    
+    if args.output:
+        output_prefix = args.output
+    else:
+        receptor_name = receptor_path.stem.replace('_predock', '')
+        ligand_name = ligand_path.stem
+        output_prefix = f"{receptor_name}_{ligand_name}"
+    
+    print("\n" + "="*60)
+    print("AUTODOCK VINA DOCKING")
+    print("="*60)
+    print(f"\nInputs:")
+    print(f"  Ligand:    {ligand_path}")
+    print(f"  Receptor:  {receptor_path}")
+    print(f"  Reference: {reference_path}")
+    print(f"\nOutput:")
+    print(f"  Directory: {outdir}")
+    print(f"  Prefix:    {output_prefix}")
+    
+    # Step 1: Extract binding site from reference
+    print("\n" + "-"*60)
+    print("Step 1: Extract binding site")
+    print("-"*60)
+    binding_site = extract_binding_site(reference_path, args.ligname, args.padding)
+    
+    # Step 2: Prepare ligand
+    print("\n" + "-"*60)
+    print("Step 2: Prepare ligand")
+    print("-"*60)
+    ligand_pdbqt = outdir / f"{output_prefix}_ligand.pdbqt"
+    if not prepare_ligand(ligand_path, ligand_pdbqt):
+        print("ERROR: Ligand preparation failed")
+        sys.exit(1)
+    
+    # Step 3: Prepare receptor
+    print("\n" + "-"*60)
+    print("Step 3: Prepare receptor")
+    print("-"*60)
+    receptor_pdbqt = outdir / f"{output_prefix}_receptor.pdbqt"
+    if not prepare_receptor(receptor_path, receptor_pdbqt):
+        print("ERROR: Receptor preparation failed")
+        sys.exit(1)
+    
+    # Step 4: Run Vina
+    print("\n" + "-"*60)
+    print("Step 4: Run docking")
+    print("-"*60)
+    output_pdbqt = outdir / f"{output_prefix}_docked.pdbqt"
+    if not run_vina(receptor_pdbqt, ligand_pdbqt, output_pdbqt, binding_site,
+                    args.exhaustiveness, args.num_modes, args.energy_range):
+        print("ERROR: Docking failed")
+        sys.exit(1)
+    
+    # Step 5: Parse and display results
+    print("\n" + "-"*60)
+    print("Step 5: Results")
+    print("-"*60)
+    results = parse_vina_results(output_pdbqt)
+    
+    if results:
+        print(f"\n  Best affinity: {results[0]['affinity']:.2f} kcal/mol")
+        print(f"  Total poses: {len(results)}")
+        print(f"\n  Top 5 poses:")
+        for r in results[:5]:
+            print(f"    Mode {r['mode']}: {r['affinity']:.2f} kcal/mol")
+        
+        # Save results to JSON
+        results_file = outdir / f"{output_prefix}_results.json"
+        with open(results_file, 'w') as f:
+            json.dump({
+                'ligand': str(ligand_path),
+                'receptor': str(receptor_path),
+                'reference': str(reference_path),
+                'binding_site': binding_site,
+                'exhaustiveness': args.exhaustiveness,
+                'poses': results,
+                'best_affinity': results[0]['affinity']
+            }, f, indent=2)
+        print(f"\n  Results saved: {results_file}")
+    else:
+        print("\n  Warning: No poses found")
+    
+    # Summary
+    print("\n" + "="*60)
+    print("DOCKING COMPLETE")
+    print("="*60)
+    print(f"\nOutput files:")
+    print(f"  {output_pdbqt}")
+    print(f"  {outdir / f'{output_prefix}_results.json'}")
+    print(f"\nVisualize:")
+    print(f"  pymol {receptor_path} {output_pdbqt}")
+    print()
+
+
+if __name__ == "__main__":
+    main()
