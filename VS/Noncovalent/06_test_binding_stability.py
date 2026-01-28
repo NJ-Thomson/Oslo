@@ -156,12 +156,13 @@ tc-grps             = Protein Non-Protein
 tau_t               = 0.1 0.1
 ref_t               = {ref_temp} {ref_temp}
 
-; Pressure coupling
-pcoupl              = Parrinello-Rahman
+; Pressure coupling (C-rescale for stability with position restraints)
+pcoupl              = C-rescale
 pcoupltype          = isotropic
-tau_p               = 2.0
+tau_p               = 5.0
 ref_p               = {ref_p}
 compressibility     = 4.5e-5
+refcoord_scaling    = com
 
 ; Velocity generation (continue from NVT)
 gen_vel             = no
@@ -386,28 +387,37 @@ echo "  xmgrace analysis/rmsd_ligand.xvg"
 
 
 def copy_input_files(complex_gro, topology, output_dir):
-    """Copy and prepare input files."""
+    """Copy and prepare input files for stability test."""
     # Copy main files
     shutil.copy(complex_gro, output_dir / 'input.gro')
-    shutil.copy(topology, output_dir / 'topol.top')
 
-    # Copy any included ITP files referenced in topology
     top_dir = Path(topology).parent.resolve()
     output_dir = Path(output_dir).resolve()
+
+    # Copy ALL .itp files from source directory
+    for itp_file in top_dir.glob('*.itp'):
+        dst_path = output_dir / itp_file.name
+        if itp_file.resolve() != dst_path.resolve():
+            shutil.copy(itp_file, dst_path)
+            print(f"  Copied: {itp_file.name}")
+
+    # Copy topology and fix any absolute paths to relative
+    new_topology_lines = []
     with open(topology) as f:
         for line in f:
             if line.strip().startswith('#include'):
-                # Extract filename from #include "filename"
                 match = line.strip().split('"')
                 if len(match) >= 2:
-                    itp_name = match[1]
-                    itp_path = top_dir / itp_name
-                    if itp_path.exists():
-                        dst_path = output_dir / itp_name
-                        # Skip if source and destination are the same file
-                        if itp_path.resolve() != dst_path.resolve():
-                            shutil.copy(itp_path, dst_path)
-                            print(f"  Copied: {itp_name}")
+                    itp_ref = match[1]
+                    # Fix absolute paths to just filename
+                    if itp_ref.startswith('/'):
+                        itp_name = Path(itp_ref).name
+                        new_topology_lines.append(f'#include "{itp_name}"\n')
+                        continue
+            new_topology_lines.append(line)
+
+    with open(output_dir / 'topol.top', 'w') as f:
+        f.writelines(new_topology_lines)
 
     return True
 

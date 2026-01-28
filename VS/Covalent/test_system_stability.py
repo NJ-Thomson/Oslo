@@ -131,12 +131,13 @@ tc-grps             = Protein Non-Protein
 tau_t               = 0.1 0.1
 ref_t               = {ref_temp} {ref_temp}
 
-; Pressure coupling
-pcoupl              = Parrinello-Rahman
+; Pressure coupling (C-rescale for stability with position restraints)
+pcoupl              = C-rescale
 pcoupltype          = isotropic
-tau_p               = 2.0
+tau_p               = 5.0
 ref_p               = {ref_p}
 compressibility     = 4.5e-5
+refcoord_scaling    = com
 
 ; Velocity generation (continue from NVT)
 gen_vel             = no

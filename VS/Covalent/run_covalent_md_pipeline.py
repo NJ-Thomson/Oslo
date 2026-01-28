@@ -1010,7 +1010,7 @@ Use --cyl-resname to specify unique names (CX1, CX2, C32, etc.) for RBFE.
 
     # Create box
     run_cmd(
-        f"{gmx} editconf -f {gro_file} -o {boxed_gro} -c -d 1.2 -bt dodecahedron",
+        f"{gmx} editconf -f {gro_file} -o {boxed_gro} -c -d 1.2 -bt cubic",
         cwd=md_dir,
         env=gmx_env
     )

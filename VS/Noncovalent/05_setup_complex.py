@@ -551,25 +551,143 @@ def generate_posres(gmx, input_gro, output_itp, force_constant=1000):
     return run_command(cmd, "Generating position restraints", input_text='4\n')
 
 
+def get_atom_names_from_itp(itp_file):
+    """
+    Extract atom names from ITP file's [ atoms ] section.
+    Returns list of atom names in order.
+    """
+    atom_names = []
+    in_atoms_section = False
+
+    with open(itp_file) as f:
+        for line in f:
+            stripped = line.strip()
+
+            # Detect atoms section
+            if stripped == '[ atoms ]':
+                in_atoms_section = True
+                continue
+
+            # End of atoms section
+            if in_atoms_section and stripped.startswith('['):
+                break
+
+            # Skip comments and empty lines
+            if in_atoms_section and stripped and not stripped.startswith(';'):
+                parts = stripped.split()
+                if len(parts) >= 5:
+                    # Format: nr type resnr residue atom cgnr charge mass
+                    atom_name = parts[4]  # atom name is 5th column
+                    atom_names.append(atom_name)
+
+    return atom_names
+
+
+def split_complex_pdb(complex_pdb, output_dir, ligand_itp, ligand_resname='LIG'):
+    """
+    Split a complex PDB into receptor and ligand components.
+    Uses atom names from ITP to ensure consistency with topology.
+
+    Args:
+        complex_pdb: Path to complex PDB (receptor + ligand)
+        output_dir: Directory for output files
+        ligand_itp: Path to ligand ITP file (for atom names)
+        ligand_resname: Residue name of ligand (default: LIG)
+
+    Returns:
+        tuple: (receptor_pdb_path, ligand_gro_path) or (None, None) on failure
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get atom names from ITP
+    itp_atom_names = get_atom_names_from_itp(ligand_itp)
+    if not itp_atom_names:
+        print(f"  ERROR: Could not extract atom names from ITP: {ligand_itp}")
+        return None, None
+    print(f"  ITP has {len(itp_atom_names)} atoms")
+
+    receptor_lines = []
+    ligand_coords = []
+
+    with open(complex_pdb) as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                resname = line[17:20].strip()
+                if resname == ligand_resname:
+                    # Extract coordinates (in Angstroms)
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    ligand_coords.append((x, y, z))
+                else:
+                    receptor_lines.append(line)
+            elif line.startswith(('TER', 'END')):
+                continue
+
+    if not receptor_lines:
+        print(f"  ERROR: No receptor atoms found in complex")
+        return None, None
+
+    if not ligand_coords:
+        print(f"  ERROR: No ligand atoms with resname '{ligand_resname}' found in complex")
+        return None, None
+
+    print(f"  Complex has {len(ligand_coords)} ligand atoms")
+
+    # Check atom count matches
+    if len(ligand_coords) != len(itp_atom_names):
+        print(f"  ERROR: Atom count mismatch! ITP has {len(itp_atom_names)}, complex has {len(ligand_coords)}")
+        print(f"  This may be due to different hydrogen counts. Try re-parameterizing the ligand.")
+        return None, None
+
+    # Write receptor PDB
+    receptor_pdb = output_dir / 'receptor_from_complex.pdb'
+    with open(receptor_pdb, 'w') as f:
+        f.writelines(receptor_lines)
+        f.write('TER\n')
+        f.write('END\n')
+
+    # Write ligand GRO with correct atom names from ITP
+    ligand_gro = output_dir / 'ligand_from_complex.gro'
+    with open(ligand_gro, 'w') as f:
+        f.write(f"{ligand_resname} extracted from docked complex\n")
+        f.write(f"{len(ligand_coords):5d}\n")
+        for i, (atom_name, (x, y, z)) in enumerate(zip(itp_atom_names, ligand_coords), 1):
+            # Convert Angstroms to nm
+            x_nm = x / 10.0
+            y_nm = y / 10.0
+            z_nm = z / 10.0
+            f.write(f"{1:5d}{ligand_resname:5s}{atom_name:>5s}{i:5d}{x_nm:8.3f}{y_nm:8.3f}{z_nm:8.3f}\n")
+        f.write("   0.00000   0.00000   0.00000\n")
+
+    print(f"  Extracted receptor: {receptor_pdb}")
+    print(f"  Extracted ligand:   {ligand_gro} (with ITP atom names)")
+
+    return receptor_pdb, ligand_gro
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Setup GROMACS protein-ligand complex",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    # Required arguments
-    parser.add_argument('--receptor', '-r', required=True,
-                        help='Receptor PDB file')
+    # Input options (two modes)
+    parser.add_argument('--complex', '-c', default=None,
+                        help='Docked complex PDB (receptor + ligand from docking). Use this OR --receptor + --ligand_gro')
+    parser.add_argument('--receptor', '-r', default=None,
+                        help='Receptor PDB file (use with --ligand_gro)')
+    parser.add_argument('--ligand_gro', default=None,
+                        help='Ligand GRO coordinate file (use with --receptor)')
     parser.add_argument('--ligand_itp', required=True,
                         help='Ligand ITP topology file (from 04_parameterize_ligand.py)')
-    parser.add_argument('--ligand_gro', required=True,
-                        help='Ligand GRO coordinate file (from 04_parameterize_ligand.py)')
     parser.add_argument('--output_dir', '-o', required=True,
                         help='Output directory')
 
     # Optional arguments
     parser.add_argument('--docked_pose', '-d', default=None,
-                        help='Docked ligand SDF to extract coordinates from')
+                        help='Docked ligand SDF to update coordinates (only with --receptor mode)')
     parser.add_argument('--ligand_resname', default='LIG',
                         help='Ligand residue name (default: LIG)')
     parser.add_argument('--ff', default='amber99sb-ildn',
@@ -590,16 +708,48 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate inputs
-    receptor_path = Path(args.receptor)
-    ligand_itp = Path(args.ligand_itp)
-    ligand_gro = Path(args.ligand_gro)
+    # Create output directory early (needed for split_complex)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for path, name in [(receptor_path, 'Receptor'), (ligand_itp, 'Ligand ITP'),
-                       (ligand_gro, 'Ligand GRO')]:
-        if not path.exists():
-            print(f"ERROR: {name} file not found: {path}")
+    resname = args.ligand_resname[:3].upper()
+
+    # Validate inputs - two modes
+    ligand_itp = Path(args.ligand_itp)
+    if not ligand_itp.exists():
+        print(f"ERROR: Ligand ITP file not found: {ligand_itp}")
+        sys.exit(1)
+
+    if args.complex:
+        # Mode 1: Use complex PDB
+        complex_path = Path(args.complex)
+        if not complex_path.exists():
+            print(f"ERROR: Complex PDB not found: {complex_path}")
             sys.exit(1)
+
+        print("\n" + "-"*60)
+        print("Extracting receptor and ligand from complex PDB")
+        print("-"*60)
+        receptor_path, ligand_gro = split_complex_pdb(complex_path, output_dir, ligand_itp, resname)
+
+        if receptor_path is None:
+            print("ERROR: Failed to extract receptor/ligand from complex")
+            sys.exit(1)
+
+    elif args.receptor and args.ligand_gro:
+        # Mode 2: Separate receptor and ligand files
+        receptor_path = Path(args.receptor)
+        ligand_gro = Path(args.ligand_gro)
+
+        if not receptor_path.exists():
+            print(f"ERROR: Receptor file not found: {receptor_path}")
+            sys.exit(1)
+        if not ligand_gro.exists():
+            print(f"ERROR: Ligand GRO file not found: {ligand_gro}")
+            sys.exit(1)
+    else:
+        print("ERROR: Must specify either --complex OR both --receptor and --ligand_gro")
+        sys.exit(1)
 
     # Find GROMACS
     gmx = args.gmx or find_gmx()
@@ -607,20 +757,17 @@ def main():
         print("ERROR: GROMACS not found. Please install GROMACS or specify --gmx")
         sys.exit(1)
 
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    resname = args.ligand_resname[:3].upper()
-
     print("\n" + "="*60)
     print("GROMACS COMPLEX SETUP")
     print("="*60)
     print(f"\nInputs:")
-    print(f"  Receptor:    {receptor_path}")
+    if args.complex:
+        print(f"  Complex:     {args.complex}")
+    else:
+        print(f"  Receptor:    {receptor_path}")
+        print(f"  Ligand GRO:  {ligand_gro}")
     print(f"  Ligand ITP:  {ligand_itp}")
-    print(f"  Ligand GRO:  {ligand_gro}")
-    if args.docked_pose:
+    if args.docked_pose and not args.complex:
         print(f"  Docked pose: {args.docked_pose}")
     print(f"\nParameters:")
     print(f"  Force field: {args.ff}")

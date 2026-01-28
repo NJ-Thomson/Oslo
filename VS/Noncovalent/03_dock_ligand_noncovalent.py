@@ -28,8 +28,16 @@ import sys
 import argparse
 import subprocess
 import json
+import re
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
+
+try:
+    from rdkit import Chem
+    HAS_RDKIT = True
+except ImportError:
+    HAS_RDKIT = False
 
 
 def run_command(cmd, description, verbose=True):
@@ -259,6 +267,262 @@ def export_docked_poses_meeko(vina_out_pdbqt, out_sdf, best_only=True):
     return run_command(cmd, "Exporting docked poses to SDF with Meeko")
 
 
+def sdf_to_pdb(sdf_file, pdb_file, resname='LIG'):
+    """Convert SDF to PDB using Open Babel."""
+    cmd = ['obabel', str(sdf_file), '-O', str(pdb_file), '-h']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+
+    # Fix residue name in output PDB
+    lines = []
+    with open(pdb_file) as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                # Replace residue name (columns 18-20)
+                line = line[:17] + f'{resname:>3}' + line[20:]
+            lines.append(line)
+    with open(pdb_file, 'w') as f:
+        f.writelines(lines)
+    return True
+
+
+def create_complex_pdb(receptor_pdb, ligand_sdf, output_pdb, ligand_resname='LIG'):
+    """
+    Create complex PDB by combining receptor and docked ligand.
+    """
+    ensure_parent_dir(output_pdb)
+
+    # Convert ligand SDF to PDB
+    ligand_pdb = Path(output_pdb).parent / 'ligand_temp.pdb'
+    if not sdf_to_pdb(ligand_sdf, ligand_pdb, ligand_resname):
+        print("  Warning: Could not convert ligand to PDB")
+        return False
+
+    # Read receptor (exclude END/ENDMDL)
+    receptor_lines = []
+    with open(receptor_pdb) as f:
+        for line in f:
+            if not line.startswith(('END', 'ENDMDL')):
+                receptor_lines.append(line)
+
+    # Read ligand atoms
+    ligand_lines = []
+    with open(ligand_pdb) as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                # Change ATOM to HETATM for ligand
+                line = 'HETATM' + line[6:]
+                ligand_lines.append(line)
+
+    # Write combined complex
+    with open(output_pdb, 'w') as f:
+        f.writelines(receptor_lines)
+        f.write('TER\n')
+        f.writelines(ligand_lines)
+        f.write('END\n')
+
+    # Clean up temp file
+    if ligand_pdb.exists():
+        ligand_pdb.unlink()
+
+    return True
+
+
+# =============================================================================
+# H-bond screening functions
+# =============================================================================
+
+HBOND_DIST_MAX = 3.5  # Angstroms
+DONORS = {'N', 'O'}
+ACCEPTORS = {'N', 'O', 'F'}
+
+
+def parse_residue_spec(spec):
+    """Parse residue spec like 'M816' into (resname, resnum)."""
+    aa_map = {
+        'A': 'ALA', 'R': 'ARG', 'N': 'ASN', 'D': 'ASP', 'C': 'CYS',
+        'E': 'GLU', 'Q': 'GLN', 'G': 'GLY', 'H': 'HIS', 'I': 'ILE',
+        'L': 'LEU', 'K': 'LYS', 'M': 'MET', 'F': 'PHE', 'P': 'PRO',
+        'S': 'SER', 'T': 'THR', 'W': 'TRP', 'Y': 'TYR', 'V': 'VAL'
+    }
+    spec = spec.strip().upper()
+    match = re.match(r'([A-Z]+)(\d+)', spec)
+    if match:
+        res_name = match.group(1)
+        res_num = int(match.group(2))
+        if len(res_name) == 1 and res_name in aa_map:
+            res_name = aa_map[res_name]
+        return res_name, res_num
+    return None, None
+
+
+def parse_pdb_for_hbonds(pdb_file, residue_filter=None):
+    """Parse PDB atoms for H-bond analysis."""
+    atoms = []
+    with open(pdb_file) as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                atom_name = line[12:16].strip()
+                res_name = line[17:20].strip()
+                try:
+                    res_num = int(line[22:26])
+                except ValueError:
+                    continue
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                element = line[76:78].strip() if len(line) > 76 else atom_name[0]
+
+                if residue_filter and res_num not in residue_filter:
+                    continue
+
+                atoms.append({
+                    'name': atom_name,
+                    'resname': res_name,
+                    'resnum': res_num,
+                    'coords': np.array([x, y, z]),
+                    'element': element,
+                    'is_backbone': atom_name in ['N', 'CA', 'C', 'O', 'H', 'HN']
+                })
+    return atoms
+
+
+def get_ligand_atoms_rdkit(mol):
+    """Extract atom info from RDKit molecule."""
+    conf = mol.GetConformer()
+    atoms = []
+    for i, atom in enumerate(mol.GetAtoms()):
+        pos = conf.GetAtomPosition(i)
+        symbol = atom.GetSymbol()
+        atoms.append({
+            'idx': i,
+            'symbol': symbol,
+            'coords': np.array([pos.x, pos.y, pos.z]),
+            'is_donor': symbol in DONORS and atom.GetTotalNumHs() > 0,
+            'is_acceptor': symbol in ACCEPTORS
+        })
+    return atoms
+
+
+def calculate_hbonds(ligand_atoms, receptor_atoms):
+    """Calculate H-bonds between ligand and receptor."""
+    hbonds = []
+    for lig_atom in ligand_atoms:
+        for rec_atom in receptor_atoms:
+            dist = np.linalg.norm(lig_atom['coords'] - rec_atom['coords'])
+            if dist > HBOND_DIST_MAX:
+                continue
+
+            rec_element = rec_atom['element'].upper()
+            is_rec_donor = rec_element in DONORS
+            is_rec_acceptor = rec_element in ACCEPTORS
+
+            if lig_atom['is_donor'] and is_rec_acceptor:
+                hbonds.append({
+                    'lig_atom': lig_atom['symbol'],
+                    'rec_atom': rec_atom['name'],
+                    'rec_resname': rec_atom['resname'],
+                    'rec_resnum': rec_atom['resnum'],
+                    'distance': dist
+                })
+            if lig_atom['is_acceptor'] and is_rec_donor:
+                hbonds.append({
+                    'lig_atom': lig_atom['symbol'],
+                    'rec_atom': rec_atom['name'],
+                    'rec_resname': rec_atom['resname'],
+                    'rec_resnum': rec_atom['resnum'],
+                    'distance': dist
+                })
+    return hbonds
+
+
+def protonate_sdf(input_sdf, output_sdf, ph=7.4):
+    """Protonate SDF at specified pH using Open Babel."""
+    cmd = ['obabel', str(input_sdf), '-O', str(output_sdf), '-p', str(ph)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def screen_poses_for_hbonds(poses_sdf, receptor_pdb, required_residues, min_required=1, ph=7.4):
+    """
+    Screen poses for H-bonds to required residues.
+
+    Returns:
+        List of (pose_idx, mol, score, contacted_residues) for poses meeting criteria,
+        sorted by number of contacts (descending) then by original rank.
+    """
+    if not HAS_RDKIT:
+        print("  Warning: RDKit not available, skipping H-bond screening")
+        return None
+
+    # Parse required residues
+    required_resnums = set()
+    for spec in required_residues:
+        _, resnum = parse_residue_spec(spec)
+        if resnum:
+            required_resnums.add(resnum)
+
+    if not required_resnums:
+        return None
+
+    # Protonate ligand
+    poses_file = Path(poses_sdf)
+    protonated_file = poses_file.parent / f"{poses_file.stem}_pH{ph}.sdf"
+
+    if protonate_sdf(poses_file, protonated_file, ph):
+        supplier = Chem.SDMolSupplier(str(protonated_file), removeHs=False)
+    else:
+        supplier = Chem.SDMolSupplier(str(poses_sdf), removeHs=False)
+
+    # Parse receptor
+    receptor_atoms = parse_pdb_for_hbonds(receptor_pdb, residue_filter=required_resnums)
+
+    # Analyze each pose
+    results = []
+    for i, mol in enumerate(supplier):
+        if mol is None:
+            continue
+
+        lig_atoms = get_ligand_atoms_rdkit(mol)
+        hbonds = calculate_hbonds(lig_atoms, receptor_atoms)
+
+        # Find contacted required residues
+        contacted = set()
+        for hb in hbonds:
+            if hb['rec_resnum'] in required_resnums:
+                contacted.add(f"{hb['rec_resname']}{hb['rec_resnum']}")
+
+        results.append({
+            'pose_idx': i,
+            'mol': mol,
+            'n_contacts': len(contacted),
+            'contacted': list(contacted),
+            'passes': len(contacted) >= min_required
+        })
+
+    return results
+
+
+def select_best_pose_with_hbonds(screening_results, min_required=1):
+    """
+    Select best pose that meets H-bond criteria.
+    Prioritizes by: passes criteria > number of contacts > original rank.
+    """
+    if not screening_results:
+        return None
+
+    # Filter passing poses
+    passing = [r for r in screening_results if r['passes']]
+
+    if passing:
+        # Sort by number of contacts (descending), then by original pose index
+        passing.sort(key=lambda x: (-x['n_contacts'], x['pose_idx']))
+        return passing[0]
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Dock a ligand to a receptor using AutoDock Vina",
@@ -290,6 +554,14 @@ def main():
                         help='Energy range for poses in kcal/mol (default: 4.0)')
     parser.add_argument('--padding', type=float, default=10.0,
                         help='Box padding around ligand in Å (default: 10.0)')
+
+    # H-bond screening parameters
+    parser.add_argument('--prioritise_hbonds',
+                        help='Comma-separated residues to prioritise H-bonds (e.g., M816,E814,Y815,D819)')
+    parser.add_argument('--min_hbond_contacts', type=int, default=1,
+                        help='Minimum number of prioritised residues with H-bonds (default: 1)')
+    parser.add_argument('--protonate_ph', type=float, default=7.4,
+                        help='pH for ligand protonation before H-bond analysis (default: 7.4)')
 
     args = parser.parse_args()
 
@@ -410,28 +682,98 @@ def main():
     sdf_best = outdir / f"{output_prefix}_best.sdf"
     sdf_all = outdir / f"{output_prefix}_poses.sdf"
 
-    # Export just the best pose (first mode)
-    if not export_docked_poses_meeko(output_pdbqt, sdf_best, best_only=True):
-        print("WARNING: Could not export best pose SDF via Meeko")
-    # Optionally export all modes
+    # Export all poses first (needed for H-bond screening)
     export_docked_poses_meeko(output_pdbqt, sdf_all, best_only=False)
 
-    print(f"\nSDF for CHARMM-GUI:")
-    print(f"  Best pose: {sdf_best}")
-    print(f"  All poses: {sdf_all}")
+    # Step 7: H-bond screening (if requested)
+    hbond_selected = False
+    if args.prioritise_hbonds:
+        print("\n" + "-"*60)
+        print("Step 7: H-bond screening")
+        print("-"*60)
+
+        required_residues = [r.strip() for r in args.prioritise_hbonds.split(',')]
+        print(f"\n  Screening for H-bonds to: {', '.join(required_residues)}")
+        print(f"  Minimum contacts required: {args.min_hbond_contacts}")
+
+        screening_results = screen_poses_for_hbonds(
+            sdf_all, receptor_path, required_residues,
+            min_required=args.min_hbond_contacts,
+            ph=args.protonate_ph
+        )
+
+        if screening_results:
+            # Print screening summary
+            print(f"\n  Pose screening results:")
+            for r in screening_results:
+                status = "PASS" if r['passes'] else "FAIL"
+                contacts = ', '.join(r['contacted']) if r['contacted'] else 'None'
+                print(f"    Pose {r['pose_idx']+1}: {status} | Contacts: {contacts}")
+
+            # Select best pose with H-bonds
+            best_hbond = select_best_pose_with_hbonds(screening_results, args.min_hbond_contacts)
+
+            if best_hbond:
+                print(f"\n  Selected pose {best_hbond['pose_idx']+1} with {best_hbond['n_contacts']} hinge contact(s)")
+                print(f"    Contacted residues: {', '.join(best_hbond['contacted'])}")
+
+                # Write selected pose to best.sdf
+                writer = Chem.SDWriter(str(sdf_best))
+                writer.write(best_hbond['mol'])
+                writer.close()
+                hbond_selected = True
+
+                # Also write screened poses (all passing)
+                sdf_screened = outdir / f"{output_prefix}_hbond_filtered.sdf"
+                writer = Chem.SDWriter(str(sdf_screened))
+                for r in screening_results:
+                    if r['passes']:
+                        writer.write(r['mol'])
+                writer.close()
+                print(f"  Filtered poses: {sdf_screened}")
+            else:
+                print(f"\n  WARNING: No poses meet H-bond criteria!")
+                print(f"  Falling back to Vina best pose (pose 1)")
+        else:
+            print(f"\n  H-bond screening skipped (RDKit not available or no valid residues)")
+
+    # Export best pose if not already done by H-bond screening
+    if not hbond_selected:
+        if not export_docked_poses_meeko(output_pdbqt, sdf_best, best_only=True):
+            print("WARNING: Could not export best pose SDF via Meeko")
+
+    # Step 8: Create complex PDB (receptor + ligand)
+    print("\n" + "-"*60)
+    print("Step 8: Create complex PDB")
+    print("-"*60)
+    complex_pdb = outdir / f"{output_prefix}_complex.pdb"
+    if create_complex_pdb(receptor_path, sdf_best, complex_pdb, ligand_resname='LIG'):
+        print(f"  Complex PDB: {complex_pdb}")
+    else:
+        print("  WARNING: Could not create complex PDB")
+
+    print(f"\nOutput files:")
+    print(f"  Best pose SDF: {sdf_best}")
+    if hbond_selected:
+        print(f"    (Selected by H-bond criteria, not Vina score)")
+    print(f"  All poses SDF: {sdf_all}")
+    print(f"  Complex PDB:   {complex_pdb}")
 
     # Summary
     print("\n" + "="*60)
     print("DOCKING COMPLETE")
     print("="*60)
     print(f"\nOutput files:")
+    print(f"  {complex_pdb}  <- Use this for MD setup")
+    print(f"  {sdf_best}")
+    print(f"  {sdf_all}")
     print(f"  {output_pdbqt}")
     if results:
         print(f"  {outdir / f'{output_prefix}_results.json'}")
-    print(f"  {sdf_best}")
-    print(f"  {sdf_all}")
+    if hbond_selected:
+        print(f"\nNote: Best pose selected by H-bond contacts to {args.prioritise_hbonds}")
     print(f"\nVisualize:")
-    print(f"  pymol {receptor_path} {output_pdbqt}")
+    print(f"  pymol {complex_pdb}")
     print()
 
 
