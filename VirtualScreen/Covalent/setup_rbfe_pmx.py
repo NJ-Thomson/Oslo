@@ -897,7 +897,7 @@ echo "Lambda {lambda_idx} complete!"
     return script_path
 
 
-def write_master_run_script(output_dir, n_windows, gmx='gmx'):
+def write_master_run_script(output_dir, n_windows, gmx='gmx', gpu=False):
     """Write master script to run all lambda windows."""
     script = f"""#!/bin/bash
 # Master script to run all lambda windows
@@ -932,7 +932,211 @@ echo "  python analyze_fep.py"
     with open(script_path, 'w') as f:
         f.write(script)
     os.chmod(script_path, 0o755)
+
+    # Also write SLURM scripts
+    write_slurm_scripts(output_dir, n_windows, gmx, gpu)
+
     return script_path
+
+
+def write_slurm_scripts(output_dir, n_windows, gmx='gmx', gpu=False):
+    """
+    Write SLURM submission scripts for RBFE calculations.
+
+    Creates:
+    - submit_slurm.sh: SLURM job array submission script
+    - check_status.sh: Helper script to check completion status
+    """
+    # GPU-specific SLURM settings
+    if gpu:
+        gpu_gres = "#SBATCH --gres=gpu:1"
+        gpu_flag = "-nb gpu -pme gpu -bonded gpu"
+        partition = "gpu"
+    else:
+        gpu_gres = "# No GPU requested"
+        gpu_flag = ""
+        partition = "batch"
+
+    # Main SLURM submission script
+    submit_script = f"""#!/bin/bash
+#SBATCH --job-name=rbfe_fep
+#SBATCH --output=slurm_%A_%a.out
+#SBATCH --error=slurm_%A_%a.err
+#SBATCH --array=0-{n_windows - 1}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=4G
+#SBATCH --time=48:00:00
+#SBATCH --partition={partition}
+{gpu_gres}
+
+# =============================================================================
+# RBFE FEP SIMULATION - SLURM Job Array Submission
+# =============================================================================
+#
+# Usage:
+#   sbatch submit_slurm.sh
+#
+# This submits {n_windows} independent jobs (one per lambda window) as a job array.
+# Each job runs: EM -> NVT equilibration -> NPT equilibration -> Production MD
+#
+# Monitor progress:
+#   squeue -u $USER
+#   sacct -j <jobid>
+#   ./check_status.sh
+#
+# After completion, analyze with:
+#   python analyze_fep.py
+#
+# =============================================================================
+
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+# Lambda window index from SLURM array task ID
+LAMBDA_IDX=$SLURM_ARRAY_TASK_ID
+LAMBDA_DIR=$(printf "lambda%02d" $LAMBDA_IDX)
+
+echo "=============================================="
+echo "RBFE FEP - Lambda Window $LAMBDA_IDX"
+echo "=============================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Array Task ID: $SLURM_ARRAY_TASK_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Working directory: $SCRIPT_DIR/$LAMBDA_DIR"
+echo "Start time: $(date)"
+echo "=============================================="
+
+# Load GROMACS module (adjust for your cluster)
+# module load gromacs/2023
+
+GMX="{gmx}"
+GPU_FLAG="{gpu_flag}"
+
+cd "$SCRIPT_DIR/$LAMBDA_DIR"
+
+# =============================================================================
+# Energy Minimization
+# =============================================================================
+if [ ! -f em.gro ]; then
+    echo ""
+    echo "Running energy minimization..."
+    $GMX grompp -f em.mdp -c ../input/hybrid.gro -p ../input/topol.top -o em.tpr -maxwarn 5
+    $GMX mdrun -deffnm em $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "EM complete"
+else
+    echo "EM already complete, skipping..."
+fi
+
+# =============================================================================
+# NVT Equilibration
+# =============================================================================
+if [ ! -f nvt.gro ]; then
+    echo ""
+    echo "Running NVT equilibration..."
+    $GMX grompp -f nvt.mdp -c em.gro -r em.gro -p ../input/topol.top -o nvt.tpr -maxwarn 5
+    $GMX mdrun -deffnm nvt $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "NVT complete"
+else
+    echo "NVT already complete, skipping..."
+fi
+
+# =============================================================================
+# NPT Equilibration
+# =============================================================================
+if [ ! -f npt.gro ]; then
+    echo ""
+    echo "Running NPT equilibration..."
+    $GMX grompp -f npt.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p ../input/topol.top -o npt.tpr -maxwarn 5
+    $GMX mdrun -deffnm npt $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "NPT complete"
+else
+    echo "NPT already complete, skipping..."
+fi
+
+# =============================================================================
+# Production MD
+# =============================================================================
+if [ ! -f prod.gro ]; then
+    echo ""
+    echo "Running Production MD..."
+    $GMX grompp -f prod.mdp -c npt.gro -t npt.cpt -p ../input/topol.top -o prod.tpr -maxwarn 5
+    $GMX mdrun -deffnm prod $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "Production complete"
+else
+    echo "Production already complete, skipping..."
+fi
+
+echo ""
+echo "=============================================="
+echo "Lambda window $LAMBDA_IDX COMPLETE"
+echo "End time: $(date)"
+echo "=============================================="
+"""
+
+    submit_path = output_dir / 'submit_slurm.sh'
+    with open(submit_path, 'w') as f:
+        f.write(submit_script)
+    os.chmod(submit_path, 0o755)
+
+    # Status check script
+    status_script = f"""#!/bin/bash
+# Check status of RBFE FEP simulations
+
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+echo "=============================================="
+echo "RBFE FEP - Status Check"
+echo "=============================================="
+
+completed=0
+running=0
+pending=0
+
+for i in $(seq 0 {n_windows - 1}); do
+    LAMBDA_DIR=$(printf "lambda%02d" $i)
+    if [ -f "$LAMBDA_DIR/prod.gro" ]; then
+        status="COMPLETE"
+        ((completed++))
+    elif [ -f "$LAMBDA_DIR/npt.gro" ]; then
+        status="NPT done, prod running/pending"
+        ((running++))
+    elif [ -f "$LAMBDA_DIR/nvt.gro" ]; then
+        status="NVT done, npt running/pending"
+        ((running++))
+    elif [ -f "$LAMBDA_DIR/em.gro" ]; then
+        status="EM done, nvt running/pending"
+        ((running++))
+    elif [ -f "$LAMBDA_DIR/em.tpr" ]; then
+        status="EM running"
+        ((running++))
+    else
+        status="Not started"
+        ((pending++))
+    fi
+    echo "$LAMBDA_DIR: $status"
+done
+
+echo ""
+echo "=============================================="
+echo "Summary: $completed/{n_windows} complete, $running running, $pending pending"
+echo "=============================================="
+
+if [ $completed -eq {n_windows} ]; then
+    echo ""
+    echo "All windows complete! Run analysis with:"
+    echo "  python analyze_fep.py"
+fi
+"""
+
+    status_path = output_dir / 'check_status.sh'
+    with open(status_path, 'w') as f:
+        f.write(status_script)
+    os.chmod(status_path, 0o755)
+
+    return submit_path
 
 
 def write_analysis_script(output_dir, n_windows, gmx='gmx'):
@@ -1223,7 +1427,7 @@ def setup_rbfe(stateA_dir, stateB_dir, stateA_itp, stateB_itp,
     # ========================================================================
     print("\n[Step 6/6] Writing run and analysis scripts...")
 
-    write_master_run_script(output_dir, n_windows, gmx=gmx)
+    write_master_run_script(output_dir, n_windows, gmx=gmx, gpu=gpu)
     write_analysis_script(output_dir, n_windows, gmx=gmx)
 
     # Write README
@@ -1243,22 +1447,21 @@ def setup_rbfe(stateA_dir, stateB_dir, stateA_itp, stateB_itp,
 
 ## Running Simulations
 
-### Run all windows sequentially:
+### Option 1: HPC/SLURM (recommended - runs windows in parallel)
+```bash
+sbatch submit_slurm.sh
+./check_status.sh  # Monitor progress
+```
+
+### Option 2: Run all windows sequentially (local):
 ```bash
 ./run_all.sh
 ```
 
-### Run a single window:
+### Option 3: Run a single window:
 ```bash
 cd lambda00
 ./run.sh
-```
-
-### Submit to SLURM (example):
-```bash
-for i in $(seq 0 {n_windows-1}); do
-    sbatch --job-name=fep_$i --wrap="cd lambda$(printf '%02d' $i) && ./run.sh"
-done
 ```
 
 ## Analysis
@@ -1283,11 +1486,14 @@ gmx bar -f lambda*/prod.xvg -o bar.xvg
     print("=" * 70)
     print(f"\nOutput directory: {output_dir}")
     print(f"\nTo run simulations:")
-    print(f"  cd {output_dir}")
-    print(f"  ./run_all.sh")
-    print(f"\nOr run individual windows:")
-    print(f"  cd {output_dir}/lambda00")
-    print(f"  ./run.sh")
+    print(f"\n  Option 1: HPC/SLURM (recommended - runs windows in parallel)")
+    print(f"    cd {output_dir} && sbatch submit_slurm.sh")
+    print(f"\n  Option 2: Local/sequential")
+    print(f"    cd {output_dir} && ./run_all.sh")
+    print(f"\n  Check progress:")
+    print(f"    cd {output_dir} && ./check_status.sh")
+    print(f"\nAfter completion, analyze with:")
+    print(f"  cd {output_dir} && python analyze_fep.py")
 
     return 0
 
@@ -1540,7 +1746,7 @@ def setup_rbfe_rtp(stateA_dir, stateB_dir, stateA_resname, stateB_resname,
     # ========================================================================
     print("\n[Step 6/6] Writing run and analysis scripts...")
 
-    write_master_run_script(output_dir, n_windows, gmx=gmx)
+    write_master_run_script(output_dir, n_windows, gmx=gmx, gpu=gpu)
     write_analysis_script(output_dir, n_windows, gmx=gmx)
 
     # Write README
@@ -1565,22 +1771,21 @@ Ligand topologies extracted from force field RTP files:
 
 ## Running Simulations
 
-### Run all windows sequentially:
+### Option 1: HPC/SLURM (recommended - runs windows in parallel)
+```bash
+sbatch submit_slurm.sh
+./check_status.sh  # Monitor progress
+```
+
+### Option 2: Run all windows sequentially (local):
 ```bash
 ./run_all.sh
 ```
 
-### Run a single window:
+### Option 3: Run a single window:
 ```bash
 cd lambda00
 ./run.sh
-```
-
-### Submit to SLURM (example):
-```bash
-for i in $(seq 0 {n_windows-1}); do
-    sbatch --job-name=fep_$i --wrap="cd lambda$(printf '%02d' $i) && ./run.sh"
-done
 ```
 
 ## Analysis
@@ -1605,8 +1810,14 @@ gmx bar -f lambda*/prod.xvg -o bar.xvg
     print("=" * 70)
     print(f"\nOutput directory: {output_dir}")
     print(f"\nTo run simulations:")
-    print(f"  cd {output_dir}")
-    print(f"  ./run_all.sh")
+    print(f"\n  Option 1: HPC/SLURM (recommended - runs windows in parallel)")
+    print(f"    cd {output_dir} && sbatch submit_slurm.sh")
+    print(f"\n  Option 2: Local/sequential")
+    print(f"    cd {output_dir} && ./run_all.sh")
+    print(f"\n  Check progress:")
+    print(f"    cd {output_dir} && ./check_status.sh")
+    print(f"\nAfter completion, analyze with:")
+    print(f"  cd {output_dir} && python analyze_fep.py")
 
     return 0
 

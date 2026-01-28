@@ -375,7 +375,149 @@ echo "Run analysis with: ./analyze_stability.sh"
     with open(script_path, 'w') as f:
         f.write(script)
     os.chmod(script_path, 0o755)
+
+    # Also write SLURM submission script
+    write_slurm_script(output_dir, gmx, gpu)
+
     return script_path
+
+
+def write_slurm_script(output_dir, gmx='gmx', gpu=False):
+    """
+    Write SLURM submission script for stability test.
+
+    Creates:
+    - submit_slurm.sh: SLURM job submission script
+    """
+    # GPU-specific SLURM settings
+    if gpu:
+        gpu_gres = "#SBATCH --gres=gpu:1"
+        gpu_flag = "-nb gpu -pme gpu -bonded gpu"
+        partition = "gpu"
+    else:
+        gpu_gres = "# No GPU requested"
+        gpu_flag = ""
+        partition = "batch"
+
+    submit_script = f"""#!/bin/bash
+#SBATCH --job-name=stability
+#SBATCH --output=slurm_%j.out
+#SBATCH --error=slurm_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=8G
+#SBATCH --time=72:00:00
+#SBATCH --partition={partition}
+{gpu_gres}
+
+# =============================================================================
+# COVALENT COMPLEX STABILITY TEST - SLURM Job Submission
+# =============================================================================
+#
+# Usage:
+#   sbatch submit_slurm.sh
+#
+# This runs the full stability workflow:
+#   1. NVT equilibration (100 ps)
+#   2. NPT equilibration (1 ns)
+#   3. Production MD (20 ns default)
+#
+# Monitor progress:
+#   squeue -u $USER
+#   tail -f slurm_<jobid>.out
+#
+# After completion, analyze with:
+#   ./analyze_stability.sh
+#
+# =============================================================================
+
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+echo "=============================================="
+echo "COVALENT COMPLEX STABILITY TEST"
+echo "=============================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Working directory: $SCRIPT_DIR"
+echo "Start time: $(date)"
+echo "=============================================="
+
+# Load GROMACS module (adjust for your cluster)
+# module load gromacs/2023
+
+GMX="{gmx}"
+GPU_FLAG="{gpu_flag}"
+
+# Check for required input files
+if [ ! -f em.gro ]; then
+    echo "ERROR: em.gro not found. Run energy minimization first."
+    exit 1
+fi
+
+if [ ! -f topol.top ]; then
+    echo "ERROR: topol.top not found."
+    exit 1
+fi
+
+# =============================================================================
+# NVT Equilibration
+# =============================================================================
+if [ ! -f nvt.gro ]; then
+    echo ""
+    echo "[Step 1/3] NVT Equilibration..."
+    echo "----------------------------------------"
+    $GMX grompp -f nvt.mdp -c em.gro -r em.gro -p topol.top -o nvt.tpr -maxwarn 2
+    $GMX mdrun -deffnm nvt $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "NVT complete"
+else
+    echo "NVT already complete, skipping..."
+fi
+
+# =============================================================================
+# NPT Equilibration
+# =============================================================================
+if [ ! -f npt.gro ]; then
+    echo ""
+    echo "[Step 2/3] NPT Equilibration..."
+    echo "----------------------------------------"
+    $GMX grompp -f npt.mdp -c nvt.gro -r nvt.gro -p topol.top -t nvt.cpt -o npt.tpr -maxwarn 2
+    $GMX mdrun -deffnm npt $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "NPT complete"
+else
+    echo "NPT already complete, skipping..."
+fi
+
+# =============================================================================
+# Production MD
+# =============================================================================
+if [ ! -f prod.gro ]; then
+    echo ""
+    echo "[Step 3/3] Production MD..."
+    echo "----------------------------------------"
+    $GMX grompp -f prod.mdp -c npt.gro -p topol.top -t npt.cpt -o prod.tpr -maxwarn 2
+    $GMX mdrun -deffnm prod $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    echo "Production complete"
+else
+    echo "Production already complete, skipping..."
+fi
+
+echo ""
+echo "=============================================="
+echo "STABILITY TEST COMPLETE"
+echo "End time: $(date)"
+echo "=============================================="
+echo ""
+echo "Run analysis with: ./analyze_stability.sh"
+"""
+
+    submit_path = output_dir / 'submit_slurm.sh'
+    with open(submit_path, 'w') as f:
+        f.write(submit_script)
+    os.chmod(submit_path, 0o755)
+
+    return submit_path
 
 
 def setup_stability_test(md_dir, output_dir, prod_time_ns=20, ref_temp=300, gpu=False):
@@ -475,10 +617,12 @@ def setup_stability_test(md_dir, output_dir, prod_time_ns=20, ref_temp=300, gpu=
     print("Setup complete!")
     print("=" * 60)
     print(f"\nTo run the stability test:")
-    print(f"  cd {output_dir}")
-    print(f"  ./run_stability.sh")
+    print(f"\n  Option 1: HPC/SLURM (recommended)")
+    print(f"    cd {output_dir} && sbatch submit_slurm.sh")
+    print(f"\n  Option 2: Local/interactive")
+    print(f"    cd {output_dir} && ./run_stability.sh")
     print(f"\nAfter completion, analyze with:")
-    print(f"  ./analyze_stability.sh")
+    print(f"  cd {output_dir} && ./analyze_stability.sh")
     print(f"\nTotal simulation time: {(nvt_steps + npt_steps + prod_steps) * dt / 1000:.1f} ns")
     print(f"  - NVT: {nvt_steps * dt / 1000:.1f} ns")
     print(f"  - NPT: {npt_steps * dt / 1000:.1f} ns")
