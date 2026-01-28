@@ -1,0 +1,3 @@
+; Minimal MDP for genion
+integrator = steep
+nsteps = 0

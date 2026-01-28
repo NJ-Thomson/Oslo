@@ -1,0 +1,50 @@
+; NPT equilibration with position restraints
+integrator          = md
+dt                  = 0.002
+nsteps              = 500000  ; 1.0 ns
+
+; Output control
+nstlog              = 1000
+nstenergy           = 1000
+nstxout-compressed  = 5000
+
+; Neighbor searching
+cutoff-scheme       = Verlet
+nstlist             = 20
+pbc                 = xyz
+
+; Electrostatics
+coulombtype         = PME
+rcoulomb            = 1.0
+fourierspacing      = 0.12
+
+; VdW
+vdwtype             = Cut-off
+rvdw                = 1.0
+DispCorr            = EnerPres
+
+; Temperature coupling
+tcoupl              = V-rescale
+tc-grps             = Protein Non-Protein
+tau_t               = 0.1 0.1
+ref_t               = 300 300
+
+; Pressure coupling
+pcoupl              = Parrinello-Rahman
+pcoupltype          = isotropic
+tau_p               = 2.0
+ref_p               = 1.0
+compressibility     = 4.5e-5
+
+; Velocity generation (continue from NVT)
+gen_vel             = no
+continuation        = yes
+
+; Constraints
+constraints         = h-bonds
+constraint_algorithm = LINCS
+lincs_iter          = 1
+lincs_order         = 4
+
+; Position restraints
+define              = -DPOSRES

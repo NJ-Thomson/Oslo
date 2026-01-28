@@ -1,0 +1,19 @@
+; adduct_merged_GMX_OPLS.top created by acpype (v: 2023.10.27) on Tue Jan 27 15:24:57 2026
+
+; Include forcefield parameters
+#include "ffoplsaa.itp"
+
+; Include adduct_merged_GMX.itp topology
+#include "adduct_merged_GMX.itp"
+
+; Ligand position restraints
+#ifdef POSRES_LIG
+#include "posre_adduct_merged.itp"
+#endif
+
+[ system ]
+ adduct_merged
+
+[ molecules ]
+; Compound        nmols
+ adduct_merged    1     
