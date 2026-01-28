@@ -251,11 +251,11 @@ def export_docked_poses_meeko(vina_out_pdbqt, out_sdf, best_only=True):
     ensure_parent_dir(out_sdf)
     cmd = [
         "mk_export.py",
-        "-i", str(vina_out_pdbqt),
-        "-o", str(out_sdf)
+        str(vina_out_pdbqt),
+        "-s", str(out_sdf)
     ]
-    if best_only:
-        cmd += ["--first-only"]
+    if not best_only:
+        cmd += ["--all_dlg_poses"]
     return run_command(cmd, "Exporting docked poses to SDF with Meeko")
 
 
