@@ -1,0 +1,80 @@
+; Energy minimisation - {{STAGE}} stage, lambda {{STATE}}
+
+;----------------------------------------------------
+; RUN CONTROL & MINIMIZATION
+;----------------------------------------------------
+define                 = -DFLEXIBLE
+integrator             = steep
+nsteps                 = 10000
+emtol                  = 100
+emstep                 = 0.01
+nstcomm                = 100
+pbc                    = xyz
+
+;----------------------------------------------------
+; OUTPUT CONTROL
+;----------------------------------------------------
+nstxout                = 250
+nstvout                = 0
+nstfout                = 0
+nstxout-compressed     = 500
+compressed-x-precision = 1000
+nstlog                 = 500
+nstenergy              = 500
+nstcalcenergy          = 100
+
+;----------------------------------------------------
+; NEIGHBOR SEARCHING
+;----------------------------------------------------
+cutoff-scheme          = Verlet
+ns-type                = grid
+nstlist                = 1
+rlist                  = 1.2
+
+;----------------------------------------------------
+; BONDS
+;----------------------------------------------------
+constraints            = none
+
+;----------------------------------------------------
+; ELECTROSTATICS
+;----------------------------------------------------
+coulombtype            = PME
+rcoulomb               = 1.0
+pme-order              = 4
+fourierspacing         = 0.10
+ewald-rtol             = 1e-6
+
+;----------------------------------------------------
+; VDW
+;----------------------------------------------------
+vdwtype                 = Cut-off
+vdw-modifier            = Potential-shift-Verlet
+verlet-buffer-tolerance = 0.005
+rvdw                    = 1.0
+DispCorr                = EnerPres
+
+;----------------------------------------------------
+; TEMPERATURE & PRESSURE COUPL
+;----------------------------------------------------
+tcoupl              = no
+pcoupl              = no
+gen-vel             = no
+
+;----------------------------------------------------
+; FREE ENERGY
+;----------------------------------------------------
+free-energy              = yes
+couple-moltype           = {{LIGAND_MOLTYPE}}
+couple-lambda0           = {{COUPLE_LAMBDA0}}
+couple-lambda1           = {{COUPLE_LAMBDA1}}
+sc-alpha                 = 0.5
+sc-power                 = 1
+sc-sigma                 = 0.3
+init-lambda-state        = {{STATE}}
+{{LAMBDA_VECTORS}}
+nstdhdl                  = 100
+dhdl-print-energy        = total
+calc-lambda-neighbors    = -1
+separate-dhdl-file       = yes
+couple-intramol          = yes

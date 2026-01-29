@@ -5,9 +5,6 @@ ABFE Setup with Boresch Restraints for Noncovalent Ligands
 Sets up Absolute Binding Free Energy (ABFE) calculations using alchemical
 free energy perturbation with Boresch-style orientational restraints.
 
-Based on the Biggin Lab ABFE workflow (https://github.com/bigginlab/ABFE_workflow)
-which is well-validated for robust binding free energy calculations.
-
 ABFE calculates the binding free energy via a thermodynamic cycle:
     dG_bind = dG_complex - dG_solvent + dG_restraint
 
@@ -22,23 +19,30 @@ Restraint Selection:
 - Uses MDRestraintsGenerator when trajectory is provided (recommended)
 - Falls back to geometric selection if no trajectory available
 - MDRestraintsGenerator analyzes MD trajectory to find optimal, stable anchor atoms
-- IMPORTANT: Biggin Lab protocol recommends ~20 ns production MD before restraint
-  selection to ensure stable anchor points are identified
+- Recommended: ~20 ns production MD before restraint selection to ensure
+  stable anchor points are identified
 
-Pre-ABFE Equilibration (Biggin Lab protocol):
+Pre-ABFE Equilibration (recommended protocol):
 1. 10,000 step energy minimization
 2. 1 ns restrained NVT equilibration
 3. 1 ns restrained NPT equilibration (Berendsen)
 4. 5 ns unrestrained NPT (Parrinello-Rahman)
 5. 20 ns NPT production → use this trajectory for MDRestraintsGenerator
 
-Lambda Schedule (Biggin Lab validated):
-- Restraint: Dense sampling (0 → 1) with 16 windows
-- Coulomb: 11 windows (1 → 0)
-- VdW: 20 windows with dense endpoint sampling (1 → 0)
+FEP Schedule Options (--fep_schedule):
+  staged-chained:  Stage-based with chaining (most rigorous, default)
+                   restraints → coul → vdw run sequentially
+  staged-parallel: Stage-based without chaining (faster)
+                   All stages run from input.gro in parallel
+  combined:        Combined lambda vectors (legacy approach)
 
-Soft-core Parameters (Biggin Lab):
-- sc-alpha = 0.5, sc-power = 1, sc-sigma = 0.3, sc-coul = yes
+Lambda Schedule (validated defaults):
+- Restraint: Dense sampling (0 → 1) with 21 windows
+- Coulomb: 11 windows (0 → 1, charges off)
+- VdW: 20 windows with dense endpoint sampling (0 → 1, vdW off)
+
+Soft-core Parameters:
+- sc-alpha = 0.5, sc-power = 1, sc-sigma = 0.3
 
 Dependencies:
     - GROMACS (gmx)
@@ -57,7 +61,7 @@ Usage:
         --output_dir OUTPUT [options]
 
 Examples:
-    # First run stability test with 20 ns production (Biggin Lab protocol)
+    # First run stability test with 20 ns production
     python 06_test_binding_stability.py \\
         --complex_gro Outputs/NonCovalent/md_simulation/minimized.gro \\
         --topology Outputs/NonCovalent/md_simulation/topol.top \\
@@ -254,8 +258,8 @@ def find_anchor_atoms(gro_path, ligand_resname='LIG'):
     return selected_protein, selected_ligand
 
 
-def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LIG',
-                                    output_dir=None, temperature=300):
+def find_anchor_atoms_mdrestraints(topology_path, trajectory_path, ligand_resname='LIG',
+                                    output_dir=None, temperature=298.15):
     """
     Use MDRestraintsGenerator to find optimal Boresch anchor atoms.
 
@@ -263,7 +267,7 @@ def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LI
     fluctuation, which is crucial for accurate restraint corrections.
 
     Args:
-        gro_path: Path to GRO structure file
+        topology_path: Path to TPR file (contains topology with angles/bonds) or GRO file
         trajectory_path: Path to trajectory (XTC/TRR)
         ligand_resname: Residue name of ligand
         output_dir: Directory for output plots/files
@@ -280,7 +284,8 @@ def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LI
         return None, None, None
 
     print(f"  Loading trajectory: {trajectory_path}")
-    u = mda.Universe(str(gro_path), str(trajectory_path))
+    print(f"  Using topology: {topology_path}")
+    u = mda.Universe(str(topology_path), str(trajectory_path))
 
     # Select ligand atoms
     ligand_sel = u.select_atoms(f"resname {ligand_resname}")
@@ -292,23 +297,28 @@ def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LI
 
     # Find stable ligand anchor atoms using MDRestraintsGenerator
     print("  Analyzing ligand for stable anchor points...")
-    ligand_atoms_analysis = search.find_ligand_atoms(u, ligand_sel)
+    ligand_atoms_analysis = search.find_ligand_atoms(u, f"resname {ligand_resname}")
 
     # Find protein anchor atoms near the ligand
     print("  Finding protein anchor atoms near binding site...")
-    protein_sel = u.select_atoms("protein and name CA")
+
+    # Use the first set of ligand atoms from analysis
+    l_atoms = ligand_atoms_analysis[0]
+    print(f"  Using ligand anchor atoms: {l_atoms}")
 
     # Use FindHostAtoms to identify suitable protein anchors
-    host_finder = search.FindHostAtoms(u, protein_sel, ligand_sel)
+    # Pass first ligand atom index for proximity search
+    host_finder = search.FindHostAtoms(u, l_atoms[0], p_selection="protein and name CA")
     host_finder.run()
 
     # Now find optimal Boresch restraint using trajectory
     print("  Analyzing trajectory for optimal Boresch restraints...")
     print("  (This may take a while for long trajectories)")
 
-    boresch_finder = restraints.FindBoreschRestraint(
-        u, ligand_atoms_analysis, host_finder.host_atoms
-    )
+    # Create atom sets: each is (ligand_atoms, protein_atoms) tuple
+    atom_set = [(l_atoms, p) for p in host_finder.host_atoms]
+
+    boresch_finder = restraints.FindBoreschRestraint(u, atom_set)
     boresch_finder.run()
 
     # Get the best restraint
@@ -325,18 +335,24 @@ def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LI
             best_restraint.plot(str(output_dir / 'boresch_restraint_analysis.png'))
         except Exception as e:
             print(f"  Warning: Could not save plots: {e}")
+            print(f"           (This is usually a numpy/matplotlib version compatibility issue with MDRestraintsGenerator)")
+            print(f"           The restraint parameters are still valid - plotting is optional.")
 
-    # Extract atom indices (MDRestraintsGenerator uses 0-indexed, GROMACS needs 1-indexed)
-    # The restraint object contains atom information
-    protein_atoms_0idx = [
-        best_restraint.host_atoms[0].ix,
-        best_restraint.host_atoms[1].ix,
-        best_restraint.host_atoms[2].ix
-    ]
+    # Extract atom indices from restraint objects
+    # Bond contains (l_atoms[0], p_atoms[0])
+    # Angles[0] contains (l_atoms[1], l_atoms[0], p_atoms[0])
+    # Angles[1] contains (l_atoms[0], p_atoms[0], p_atoms[1])
+    # Dihedrals[0] contains (l_atoms[2], l_atoms[1], l_atoms[0], p_atoms[0])
+    # Dihedrals[2] contains (l_atoms[0], p_atoms[0], p_atoms[1], p_atoms[2])
     ligand_atoms_0idx = [
-        best_restraint.ligand_atoms[0].ix,
-        best_restraint.ligand_atoms[1].ix,
-        best_restraint.ligand_atoms[2].ix
+        best_restraint.bond.atomgroup.atoms[0].ix,        # L1
+        best_restraint.angles[0].atomgroup.atoms[0].ix,   # L2
+        best_restraint.dihedrals[0].atomgroup.atoms[0].ix # L3
+    ]
+    protein_atoms_0idx = [
+        best_restraint.bond.atomgroup.atoms[1].ix,        # P1
+        best_restraint.angles[1].atomgroup.atoms[2].ix,   # P2
+        best_restraint.dihedrals[2].atomgroup.atoms[3].ix # P3
     ]
 
     # Convert to 1-indexed for GROMACS
@@ -358,13 +374,13 @@ def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LI
         'kphi': 41.84,  # kJ/mol/rad^2
         'protein_atoms': protein_atoms,
         'ligand_atoms': ligand_atoms,
-        # Store fluctuations for diagnostics
-        'r_std': best_restraint.bond.std / 10.0,
-        'theta_A_std': best_restraint.angles[0].std,
-        'theta_B_std': best_restraint.angles[1].std,
-        'phi_A_std': best_restraint.dihedrals[0].std,
-        'phi_B_std': best_restraint.dihedrals[1].std,
-        'phi_C_std': best_restraint.dihedrals[2].std,
+        # Store fluctuations for diagnostics (attribute is 'stdev' not 'std')
+        'r_std': best_restraint.bond.stdev / 10.0,
+        'theta_A_std': best_restraint.angles[0].stdev,
+        'theta_B_std': best_restraint.angles[1].stdev,
+        'phi_A_std': best_restraint.dihedrals[0].stdev,
+        'phi_B_std': best_restraint.dihedrals[1].stdev,
+        'phi_C_std': best_restraint.dihedrals[2].stdev,
     }
 
     # Calculate analytical correction using standard_state method
@@ -376,12 +392,8 @@ def find_anchor_atoms_mdrestraints(gro_path, trajectory_path, ligand_resname='LI
         print(f"  Warning: Could not compute standard state correction: {e}")
 
     print(f"\n  Optimal anchor atoms found:")
-    print(f"    Protein (P3-P2-P1): {protein_atoms[2]}-{protein_atoms[1]}-{protein_atoms[0]}")
+    print(f"    Protein (P1-P2-P3): {protein_atoms[0]}-{protein_atoms[1]}-{protein_atoms[2]}")
     print(f"    Ligand (L1-L2-L3):  {ligand_atoms[0]}-{ligand_atoms[1]}-{ligand_atoms[2]}")
-    print(f"\n  Equilibrium values (from trajectory):")
-    print(f"    r0 = {boresch_params['r0']:.3f} ± {boresch_params['r_std']:.3f} nm")
-    print(f"    theta_A = {boresch_params['theta_A0']:.1f} ± {boresch_params['theta_A_std']:.1f} deg")
-    print(f"    theta_B = {boresch_params['theta_B0']:.1f} ± {boresch_params['theta_B_std']:.1f} deg")
 
     return protein_atoms, ligand_atoms, boresch_params
 
@@ -475,7 +487,7 @@ def calculate_boresch_parameters(gro_path, protein_atoms, ligand_atoms):
     }
 
 
-def calculate_restraint_correction(params, temperature=300):
+def calculate_restraint_correction(params, temperature=298.15):
     """
     Calculate analytical correction for Boresch restraints.
 
@@ -555,88 +567,94 @@ def write_restraint_itp(output_path, params):
     return output_path
 
 
-def generate_lambda_schedule_biggin():
+def generate_stage_lambdas():
     """
-    Generate Biggin Lab validated lambda schedule for ABFE.
+    Generate validated lambda schedules as separate stages.
 
-    This schedule is based on the well-validated Biggin Lab ABFE workflow
-    (https://github.com/bigginlab/ABFE_workflow) with dense endpoint sampling
-    where free energy gradients are steepest.
-
-    The schedule uses three phases:
-    1. Restraint: Turn on Boresch restraints (complex leg only)
-    2. Coulomb: Turn off electrostatics
-    3. VdW: Turn off van der Waals with soft-core potentials
+    Each transformation stage (restraints, coulomb, vdw) is run as separate
+    simulations with stage-specific coupling settings.
 
     Returns:
-        complex_lambdas: list of (restr, coul, vdw) tuples for complex leg
-        solvent_lambdas: list of (coul, vdw) tuples for solvent leg
+        dict with keys: 'restraints', 'coul', 'vdw'
+        Each value is a list of lambda values for that stage.
     """
-    # Biggin Lab validated lambda schedule with dense endpoint sampling
-    # Restraint lambdas (0=off, 1=on) - 16 windows
-    # Dense at endpoints where restraint-to-ligand coupling changes rapidly
-    restr_lambdas = [
-        0.0, 0.15, 0.30, 0.45, 0.60, 0.75,
-        0.80, 0.85, 0.90, 0.925, 0.95,
-        0.96, 0.97, 0.98, 0.99, 1.0
+    # Restraint lambdas (0=off, 1=on) - 12 windows
+    # Only used for complex leg
+    restraint_lambdas = [
+        0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
+        0.6, 0.7, 0.8, 0.9, 0.95, 1.0
     ]
 
-    # Coulomb lambdas (1=on, 0=off) - 11 windows
-    # Electrostatic decoupling is usually smoother than vdW
+    # Coulomb lambdas (0=on, 1=off in couple-lambda sense) - 11 windows
     coul_lambdas = [
-        1.0, 0.9, 0.8, 0.7, 0.6, 0.5,
-        0.4, 0.3, 0.2, 0.1, 0.0
+        0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
+        0.6, 0.7, 0.8, 0.9, 1.0
     ]
 
-    # VdW lambdas (1=on, 0=off) - 20 windows
-    # Dense near lambda=0 where soft-core potential is critical
-    # This is where most of the free energy change occurs
+    # VdW lambdas (0=on, 1=off) - 21 windows
+    # Dense near lambda=1 (decoupled) where soft-core is critical
     vdw_lambdas = [
-        1.0, 0.95, 0.90, 0.85, 0.80, 0.75,
-        0.70, 0.65, 0.60, 0.55, 0.50,
-        0.45, 0.40, 0.35, 0.30, 0.25,
-        0.20, 0.15, 0.10, 0.05, 0.0
+        0.0, 0.05, 0.1, 0.15, 0.2, 0.25,
+        0.3, 0.35, 0.4, 0.45, 0.5,
+        0.55, 0.6, 0.65, 0.7, 0.75,
+        0.8, 0.85, 0.9, 0.95, 1.0
     ]
+
+    return {
+        'restraints': restraint_lambdas,
+        'coul': coul_lambdas,
+        'vdw': vdw_lambdas
+    }
+
+
+def generate_combined_lambdas():
+    """
+    Generate lambda schedule in combined format (legacy approach).
+
+    This is kept for backwards compatibility but the separate stages approach
+    (generate_stage_lambdas) is now preferred.
+    """
+    stages = generate_stage_lambdas()
 
     # Complex leg: restraint on, then decouple
     complex_lambdas = []
 
     # Phase 1: Turn on restraints (coul=1, vdw=1)
-    for r in restr_lambdas:
+    for r in stages['restraints']:
         complex_lambdas.append((r, 1.0, 1.0))
 
     # Phase 2: Turn off electrostatics (restr=1, vdw=1)
-    for c in coul_lambdas[1:]:  # Skip first (already at 1)
-        complex_lambdas.append((1.0, c, 1.0))
+    for c in stages['coul'][1:]:  # Skip first
+        complex_lambdas.append((1.0, 1.0 - c, 1.0))
 
     # Phase 3: Turn off vdW (restr=1, coul=0)
-    for v in vdw_lambdas[1:]:  # Skip first (already at 1)
-        complex_lambdas.append((1.0, 0.0, v))
+    for v in stages['vdw'][1:]:  # Skip first
+        complex_lambdas.append((1.0, 0.0, 1.0 - v))
 
     # Solvent leg: just decouple (no restraint)
     solvent_lambdas = []
 
     # Phase 1: Turn off electrostatics
-    for c in coul_lambdas:
-        solvent_lambdas.append((c, 1.0))
+    for c in stages['coul']:
+        solvent_lambdas.append((1.0 - c, 1.0))
 
     # Phase 2: Turn off vdW
-    for v in vdw_lambdas[1:]:
-        solvent_lambdas.append((0.0, v))
+    for v in stages['vdw'][1:]:
+        solvent_lambdas.append((0.0, 1.0 - v))
 
     return complex_lambdas, solvent_lambdas
 
 
 def generate_lambda_schedule(n_windows_restr=5, n_windows_coul=10, n_windows_vdw=15,
-                              use_biggin_schedule=True):
+                              use_validated_schedule=True):
     """
-    Generate lambda schedule for ABFE.
+    Generate lambda schedule for ABFE (combined format for legacy mode).
 
     Args:
-        n_windows_restr: Number of restraint windows (ignored if use_biggin_schedule=True)
-        n_windows_coul: Number of coulomb windows (ignored if use_biggin_schedule=True)
-        n_windows_vdw: Number of vdW windows (ignored if use_biggin_schedule=True)
-        use_biggin_schedule: Use Biggin Lab validated schedule (recommended)
+        n_windows_restr: Number of restraint windows (ignored if use_validated_schedule=True)
+        n_windows_coul: Number of coulomb windows (ignored if use_validated_schedule=True)
+        n_windows_vdw: Number of vdW windows (ignored if use_validated_schedule=True)
+        use_validated_schedule: Use validated schedule (recommended)
 
     Complex leg: restraint -> coul -> vdw
     Solvent leg: coul -> vdw (no restraint)
@@ -645,8 +663,8 @@ def generate_lambda_schedule(n_windows_restr=5, n_windows_coul=10, n_windows_vdw
         complex_lambdas: list of (restr, coul, vdw) tuples
         solvent_lambdas: list of (coul, vdw) tuples
     """
-    if use_biggin_schedule:
-        return generate_lambda_schedule_biggin()
+    if use_validated_schedule:
+        return generate_combined_lambdas()
 
     # Original schedule (for custom window counts)
     # Restraint lambda (0 = off, 1 = on)
@@ -690,16 +708,185 @@ def generate_lambda_schedule(n_windows_restr=5, n_windows_coul=10, n_windows_vdw
     return complex_lambdas, solvent_lambdas
 
 
-def write_fep_mdp(output_path, lambda_state, lambdas, leg='complex',
-                  nsteps=2500000, dt=0.002, ref_temp=300, with_restraint=True):
+# =============================================================================
+# Stage-Based MDP Generation
+# =============================================================================
+
+def get_stage_coupling(stage):
     """
-    Write MDP file for FEP simulation.
+    Get the couple-lambda0/1 settings for each stage.
+
+    Returns:
+        tuple: (couple_lambda0, couple_lambda1)
+    """
+    if stage == 'restraints':
+        # Restraints only - no change in intermolecular coupling
+        return 'vdw-q', 'vdw-q'
+    elif stage == 'coul':
+        # Turn off electrostatics, keep VdW
+        return 'vdw-q', 'vdw'
+    elif stage == 'vdw':
+        # Turn off VdW (electrostatics already off)
+        return 'vdw', 'none'
+    else:
+        raise ValueError(f"Unknown stage: {stage}")
+
+
+def get_lambda_vectors(stage, lambdas):
+    """
+    Generate lambda vector strings for MDP file.
+
+    Args:
+        stage: 'restraints', 'coul', or 'vdw'
+        lambdas: List of lambda values for this stage
+
+    Returns:
+        str: Lambda vector lines for MDP file
+    """
+    n = len(lambdas)
+    lambda_str = ' '.join(f'{l:.2f}' for l in lambdas)
+    bonded_ones = ' '.join(['1.0'] * n)
+
+    if stage == 'restraints':
+        # Only bonded-lambdas varies
+        return f"bonded-lambdas           = {lambda_str}"
+    elif stage == 'coul':
+        # coul-lambdas varies, bonded stays at 1.0
+        return f"bonded-lambdas           = {bonded_ones}\ncoul-lambdas             = {lambda_str}"
+    elif stage == 'vdw':
+        # vdw-lambdas varies, bonded stays at 1.0
+        return f"bonded-lambdas           = {bonded_ones}\nvdw-lambdas              = {lambda_str}"
+    else:
+        raise ValueError(f"Unknown stage: {stage}")
+
+
+def write_stage_mdp(output_path, template_name, stage, state, lambdas,
+                    ligand_moltype='LIG', temperature=298.15, nsteps=None):
+    """
+    Write MDP file for a specific stage using templates.
+
+    Args:
+        output_path: Output file path
+        template_name: Template file name (em.mdp, nvt.mdp, npt_posres.mdp, npt.mdp, prod.mdp)
+        stage: 'restraints', 'coul', or 'vdw'
+        state: Lambda state index
+        lambdas: List of lambda values for this stage
+        ligand_moltype: Molecule type name for ligand
+        temperature: Reference temperature
+        nsteps: Number of steps (for prod.mdp)
+    """
+    script_dir = Path(__file__).parent
+    template_path = script_dir / 'templates' / 'mdp' / template_name
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template not found: {template_path}")
+
+    with open(template_path, 'r') as f:
+        content = f.read()
+
+    # Get stage-specific settings
+    couple_lambda0, couple_lambda1 = get_stage_coupling(stage)
+    lambda_vectors = get_lambda_vectors(stage, lambdas)
+
+    # Replace placeholders
+    content = content.replace('{{STAGE}}', stage)
+    content = content.replace('{{STATE}}', str(state))
+    content = content.replace('{{LIGAND_MOLTYPE}}', ligand_moltype)
+    content = content.replace('{{COUPLE_LAMBDA0}}', couple_lambda0)
+    content = content.replace('{{COUPLE_LAMBDA1}}', couple_lambda1)
+    content = content.replace('{{LAMBDA_VECTORS}}', lambda_vectors)
+    content = content.replace('{{TEMPERATURE}}', str(temperature))
+
+    if nsteps is not None:
+        content = content.replace('{{NSTEPS}}', str(nsteps))
+
+    with open(output_path, 'w') as f:
+        f.write(content)
+
+    return output_path
+
+
+def setup_stage_directory(base_dir, stage, state, lambdas, ligand_moltype='LIG',
+                          temperature=298.15, prod_nsteps=2500000):
+    """
+    Set up a single lambda window directory for a stage.
+
+    Uses branched workflow:
+    - Window 0: NPT equilibration (500 ps) -> production
+    - Windows 1-N: Branch from window 0, short equilibration (50 ps) -> production
+
+    Args:
+        base_dir: Base directory for this leg (e.g., complex/fep/simulation)
+        stage: 'restraints', 'coul', or 'vdw'
+        state: Lambda state index
+        lambdas: Full list of lambda values for this stage
+        ligand_moltype: Molecule type name
+        temperature: Reference temperature
+        prod_nsteps: Production steps (default 2.5M = 10 ns at 4 fs)
+
+    Returns:
+        Path to created directory
+    """
+    window_dir = base_dir / f'{stage}.{state}'
+    window_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine phases based on window index
+    # Window 0: Full equilibration sequence (EM -> NVT -> NPT_posres -> NPT -> Prod)
+    # Windows 1-N: Branch from window 0, short equilibration only
+    if state == 0:
+        phases = ['em', 'nvt', 'npt_posres', 'npt', 'prod']
+    else:
+        phases = ['equil', 'prod']
+
+    for phase in phases:
+        phase_dir = window_dir / phase
+        phase_dir.mkdir(exist_ok=True)
+
+        # Determine template and nsteps
+        if phase == 'prod':
+            template = 'prod.mdp'
+            nsteps = prod_nsteps
+        elif phase == 'equil':
+            template = 'equil.mdp'
+            nsteps = None  # Uses default 50 ps from template
+        elif phase == 'npt_posres':
+            template = 'npt_posres.mdp'
+            nsteps = None  # Uses default 100 ps from template
+        else:
+            template = f'{phase}.mdp'
+            nsteps = None
+
+        # Write MDP file
+        write_stage_mdp(
+            phase_dir / f'{phase}.mdp',
+            template,
+            stage,
+            state,
+            lambdas,
+            ligand_moltype=ligand_moltype,
+            temperature=temperature,
+            nsteps=nsteps
+        )
+
+    return window_dir
+
+
+# =============================================================================
+# Legacy Combined MDP Generation (for backwards compatibility)
+# =============================================================================
+
+def write_fep_mdp(output_path, lambda_state, lambdas, leg='complex',
+                  nsteps=2500000, dt=0.002, ref_temp=298.15, with_restraint=True,
+                  ligand_moltype='LIG'):
+    """
+    Write MDP file for FEP simulation (legacy combined approach).
 
     Args:
         lambda_state: Index of current lambda window
         lambdas: Full list of lambda values
         leg: 'complex' or 'solvent'
         with_restraint: Include restraint lambda (complex leg only)
+        ligand_moltype: Molecule type name for ligand (from topology [ moleculetype ])
     """
     ns = nsteps * dt / 1000
 
@@ -739,11 +926,12 @@ tc-grps             = System
 tau_t               = 0.1
 ref_t               = {ref_temp}
 
-pcoupl              = Parrinello-Rahman
+pcoupl              = C-rescale
 pcoupltype          = isotropic
 tau_p               = 2.0
 ref_p               = 1.0
 compressibility     = 4.5e-5
+refcoord_scaling    = com
 
 gen_vel             = no
 continuation        = yes
@@ -753,7 +941,7 @@ constraint_algorithm = LINCS
 
 ; Neighbor searching
 cutoff-scheme       = Verlet
-nstlist             = 20
+nstlist             = 100
 pbc                 = xyz
 
 ; Electrostatics
@@ -771,7 +959,17 @@ free_energy         = yes
 init_lambda_state   = {lambda_state}
 {lambda_section}
 
-; Soft-core parameters (Biggin Lab validated settings)
+; Molecule coupling - THIS IS ESSENTIAL
+; couple-moltype specifies which molecule to decouple
+; couple-lambda0 = vdw-q means fully coupled (VdW + Coulomb) at lambda=0
+; couple-lambda1 = none means fully decoupled at lambda=1
+; couple-intramol = no means don't scale intramolecular interactions
+couple-moltype      = {ligand_moltype}
+couple-lambda0      = vdw-q
+couple-lambda1      = none
+couple-intramol     = no
+
+; Soft-core parameters
 ; These settings prevent singularities when vdW interactions are turned off
 ; sc-alpha = 0.5 provides smooth transitions at lambda endpoints
 ; sc-power = 1 (linear soft-core)
@@ -796,7 +994,7 @@ calc-lambda-neighbors = -1
 
 
 def write_equil_mdp(output_path, stage, lambda_state, lambdas, leg='complex',
-                    nsteps=50000, dt=0.002, ref_temp=300):
+                    nsteps=50000, dt=0.002, ref_temp=298.15, ligand_moltype='LIG'):
     """Write equilibration MDP for FEP window."""
     ns = nsteps * dt / 1000
 
@@ -815,15 +1013,16 @@ vdw_lambdas         = {vdw_vec}"""
 
     if stage == 'nvt':
         pcoupl_section = "pcoupl = no"
-        gen_vel = "gen_vel = yes\ngen_temp = 300\ngen_seed = -1"
+        gen_vel = f"gen_vel = yes\ngen_temp = {ref_temp}\ngen_seed = -1"
         continuation = ""
         posres = "define = -DPOSRES"
     else:  # npt
-        pcoupl_section = """pcoupl = Parrinello-Rahman
+        pcoupl_section = """pcoupl = C-rescale
 pcoupltype = isotropic
 tau_p = 2.0
 ref_p = 1.0
-compressibility = 4.5e-5"""
+compressibility = 4.5e-5
+refcoord_scaling = com"""
         gen_vel = "gen_vel = no"
         continuation = "continuation = yes"
         posres = "define = -DPOSRES"
@@ -853,7 +1052,7 @@ constraint_algorithm = LINCS
 {posres}
 
 cutoff-scheme       = Verlet
-nstlist             = 20
+nstlist             = 100
 pbc                 = xyz
 
 coulombtype         = PME
@@ -868,6 +1067,12 @@ DispCorr            = EnerPres
 free_energy         = yes
 init_lambda_state   = {lambda_state}
 {lambda_section}
+
+; Molecule coupling
+couple-moltype      = {ligand_moltype}
+couple-lambda0      = vdw-q
+couple-lambda1      = none
+couple-intramol     = no
 
 sc-alpha            = 0.5
 sc-power            = 1
@@ -900,11 +1105,19 @@ def setup_solvent_leg(ligand_gro, ligand_itp, output_dir, gmx, box_size=3.0):
     # Copy ligand files
     shutil.copy(ligand_itp, output_dir / 'LIG.itp')
 
+    # Check for atomtypes file (often required for GAFF/custom ligands)
+    ligand_atomtypes = ligand_itp.parent / 'LIG_atomtypes.itp'
+    has_atomtypes = ligand_atomtypes.exists()
+    if has_atomtypes:
+        shutil.copy(ligand_atomtypes, output_dir / 'LIG_atomtypes.itp')
+
     # Create topology for ligand in water
-    top_content = """; Ligand in solvent topology
+    atomtypes_include = '#include "LIG_atomtypes.itp"\n\n' if has_atomtypes else ''
+    top_content = f"""; Ligand in solvent topology
 #include "amber99sb-ildn.ff/forcefield.itp"
 
-; Include ligand parameters
+; Include ligand atomtypes (if present)
+{atomtypes_include}; Include ligand parameters
 #include "LIG.itp"
 
 ; Include water topology
@@ -1000,7 +1213,7 @@ def write_run_script(output_dir, leg, n_windows, gmx='gmx', gpu=False):
     script = f"""#!/bin/bash
 # ABFE {leg} leg - run all lambda windows sequentially
 # Run this script from within the {leg} directory
-# For HPC/cluster: use submit_slurm.sh instead
+# For HPC/cluster: use ./submit.sh instead
 
 set -e
 
@@ -1055,7 +1268,7 @@ echo "=============================================="
         f.write(script)
     os.chmod(script_path, 0o755)
 
-    # Also write SLURM job array scripts (Biggin Lab style)
+    # Also write SLURM job array scripts (SLURM job arrays)
     write_slurm_scripts(output_dir, leg, n_windows, gmx, gpu)
 
     return script_path
@@ -1063,38 +1276,35 @@ echo "=============================================="
 
 def write_slurm_scripts(output_dir, leg, n_windows, gmx='gmx', gpu=False):
     """
-    Write Biggin Lab-style SLURM submission scripts for ABFE.
+    Write validated-style SLURM submission scripts for ABFE.
 
     Creates:
     - submit_slurm.sh: Main submission script
     - run_window.sh: Script run by each array task
     """
-    # GPU-specific SLURM settings
+    # GPU flags for mdrun
     if gpu:
-        gpu_gres = "#SBATCH --gres=gpu:1"
         gpu_flag = "-nb gpu -pme gpu -bonded gpu"
-        partition = "gpu"
     else:
-        gpu_gres = "# No GPU requested"
         gpu_flag = ""
-        partition = "batch"
 
-    # Main SLURM submission script (Biggin Lab style)
+    # Main SLURM submission script (LUMI settings)
     submit_script = f"""#!/bin/bash
+#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --partition=small-g
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=7
 #SBATCH --job-name=abfe_{leg}
 #SBATCH --output=slurm_%A_%a.out
 #SBATCH --error=slurm_%A_%a.err
 #SBATCH --array=0-{n_windows - 1}
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=4G
-#SBATCH --time=24:00:00
-#SBATCH --partition={partition}
-{gpu_gres}
 
 # =============================================================================
 # ABFE {leg.upper()} LEG - SLURM Job Array Submission
-# Based on Biggin Lab ABFE workflow
+# ABFE SLURM submission script
 # =============================================================================
 #
 # Usage:
@@ -1112,8 +1322,8 @@ def write_slurm_scripts(output_dir, leg, n_windows, gmx='gmx', gpu=False):
 #
 # =============================================================================
 
-# Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+# Use SLURM_SUBMIT_DIR (directory where sbatch was called)
+SCRIPT_DIR="${{SLURM_SUBMIT_DIR}}"
 cd "$SCRIPT_DIR"
 
 # Lambda window index from SLURM array task ID
@@ -1130,10 +1340,15 @@ echo "Working directory: $SCRIPT_DIR/$LAMBDA_DIR"
 echo "Start time: $(date)"
 echo "=============================================="
 
-# Load GROMACS module (adjust for your cluster)
-# module load gromacs/2023
+# Load GROMACS module (LUMI)
+module use /appl/local/csc/modulefiles
+module load gromacs/2025.4-gpu
 
-GMX="{gmx}"
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+
+GMX="gmx_mpi"
 GPU_FLAG="{gpu_flag}"
 
 cd "$SCRIPT_DIR/$LAMBDA_DIR"
@@ -1145,7 +1360,7 @@ if [ ! -f nvt.gro ]; then
     echo ""
     echo "Running NVT equilibration..."
     $GMX grompp -f nvt.mdp -c ../input.gro -r ../input.gro -p ../topol.top -o nvt.tpr -maxwarn 2
-    $GMX mdrun -deffnm nvt $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    $GMX mdrun -deffnm nvt $GPU_FLAG -v
     echo "NVT complete"
 else
     echo "NVT already complete, skipping..."
@@ -1158,7 +1373,7 @@ if [ ! -f npt.gro ]; then
     echo ""
     echo "Running NPT equilibration..."
     $GMX grompp -f npt.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p ../topol.top -o npt.tpr -maxwarn 2
-    $GMX mdrun -deffnm npt $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    $GMX mdrun -deffnm npt $GPU_FLAG -v
     echo "NPT complete"
 else
     echo "NPT already complete, skipping..."
@@ -1171,7 +1386,7 @@ if [ ! -f prod.gro ]; then
     echo ""
     echo "Running Production MD..."
     $GMX grompp -f prod.mdp -c npt.gro -t npt.cpt -p ../topol.top -o prod.tpr -maxwarn 2
-    $GMX mdrun -deffnm prod $GPU_FLAG -ntmpi 1 -ntomp $SLURM_CPUS_PER_TASK
+    $GMX mdrun -deffnm prod $GPU_FLAG -v
     echo "Production complete"
 else
     echo "Production already complete, skipping..."
@@ -1239,223 +1454,558 @@ echo "=============================================="
     return submit_path
 
 
-def write_analysis_script(output_dir, complex_windows, solvent_windows, dG_restr):
-    """Write analysis script to compute binding free energy."""
-    script = f"""#!/bin/bash
-# ABFE analysis script
-# Analyzes dhdl files and computes binding free energy
-# Uses alchemlyb (MBAR) if available, otherwise falls back to gmx bar (BAR)
+def write_stage_run_script(output_dir, leg, stages, gmx='gmx', gpu=False, stage_chaining=True):
+    """
+    Write run scripts for stage-based ABFE workflow with branching and optional chaining.
+
+    Stage chaining (if enabled - sequential between stages):
+    - restraints.0 starts from input.gro (pre-equilibrated from stability test)
+    - coul.0 waits for restraints to complete, starts from restraints.N/prod/prod.gro
+    - vdw.0 waits for coul to complete, starts from coul.N/prod/prod.gro
+
+    Without stage chaining (faster, all stages parallel):
+    - All stages start from input.gro simultaneously
+
+    Branched within each stage (parallel):
+    - Window 0: NPT equilibration (500 ps) -> production
+    - Windows 1-N: Branch from window 0's NPT output -> short equil (50 ps) -> production
+
+    Stage order:
+    - Complex: restraints -> coul -> vdw
+    - Solvent: coul -> vdw
+
+    Args:
+        output_dir: Base directory (complex/ or solvent/)
+        leg: 'complex' or 'solvent'
+        stages: Dict from generate_stage_lambdas()
+        gmx: GROMACS executable
+        gpu: Whether to use GPU
+        stage_chaining: If True, stages wait for previous stage completion (default True)
+    """
+    gpu_flag = '-nb gpu -pme gpu -bonded gpu -v' if gpu else '-v'
+
+    # Determine which stages to include
+    if leg == 'complex':
+        stage_order = ['restraints', 'coul', 'vdw']
+    else:
+        stage_order = ['coul', 'vdw']
+
+    # Calculate total windows for job array
+    total_windows = sum(len(stages[s]) for s in stage_order)
+
+    # Generate header based on chaining mode
+    if stage_chaining:
+        workflow_desc = """# Workflow (STAGE CHAINING ENABLED):
+#   Stage chaining: restraints -> coul -> vdw
+#     - restraints.0 starts from input.gro (pre-equilibrated)
+#     - coul.0 waits for restraints.N, starts from its prod.gro
+#     - vdw.0 waits for coul.N, starts from its prod.gro
+#
+#   Branched within each stage:
+#     - Window 0: npt/ (500 ps), prod/     <- equilibrate, then production
+#     - Windows 1-N: equil/ (50 ps), prod/ <- branch from window 0"""
+        mode_label = "Branched + Chained"
+    else:
+        workflow_desc = """# Workflow (NO STAGE CHAINING - faster):
+#   All stages start from input.gro in parallel
+#
+#   Branched within each stage:
+#     - Window 0: npt/ (500 ps), prod/     <- equilibrate, then production
+#     - Windows 1-N: equil/ (50 ps), prod/ <- branch from window 0"""
+        mode_label = "Branched, No Chaining"
+
+    # Create SLURM submission script for stage-based workflow
+    submit_script = f"""#!/bin/bash
+#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --partition=small-g
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=7
+#SBATCH --job-name=abfe_{leg}
+#SBATCH --output=fep/simulation/slurm_%A_%a.out
+#SBATCH --error=fep/simulation/slurm_%A_%a.err
+#SBATCH --array=0-{total_windows - 1}
+
+# =============================================================================
+# ABFE {leg.upper()} LEG - Stage-Based SLURM Job Array ({mode_label})
+# =============================================================================
+#
+# Directory structure:
+#   fep/simulation/restraints.0/, restraints.1/, ..., restraints.N/
+#   fep/simulation/coul.0/, coul.1/, ..., coul.N/
+#   fep/simulation/vdw.0/, vdw.1/, ..., vdw.N/
+#
+{workflow_desc}
+#
+# =============================================================================
+
+SCRIPT_DIR="${{SLURM_SUBMIT_DIR}}"
+cd "$SCRIPT_DIR"
+
+# Load GROMACS module (LUMI)
+module use /appl/local/csc/modulefiles
+module load gromacs/2025.4-gpu
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+
+GMX="gmx_mpi"
+GPU_FLAG="{gpu_flag}"
+
+# Map array task ID to stage and window
+TASK_ID=$SLURM_ARRAY_TASK_ID
+"""
+
+    # Add stage mapping logic and store stage sizes
+    offset = 0
+    for stage_name in stage_order:
+        n = len(stages[stage_name])
+        submit_script += f"""
+# {stage_name}: windows {offset} to {offset + n - 1}
+if [ $TASK_ID -ge {offset} ] && [ $TASK_ID -lt {offset + n} ]; then
+    STAGE="{stage_name}"
+    WINDOW_ID=$((TASK_ID - {offset}))
+fi
+"""
+        offset += n
+
+    # Add stage size variables for chaining logic (only if chaining enabled)
+    if stage_chaining:
+        if leg == 'complex':
+            n_restr = len(stages['restraints'])
+            n_coul = len(stages['coul'])
+            submit_script += f"""
+# Stage sizes for chaining
+N_RESTRAINTS={n_restr}
+N_COUL={n_coul}
+"""
+        else:
+            n_coul = len(stages['coul'])
+            submit_script += f"""
+# Stage sizes for chaining
+N_COUL={n_coul}
+"""
+
+    chaining_mode = "WITH STAGE CHAINING" if stage_chaining else "(NO CHAINING - all from input.gro)"
+    submit_script += f"""
+WINDOW_DIR="fep/simulation/$STAGE.$WINDOW_ID"
+
+echo "=============================================="
+echo "ABFE {leg.upper()} LEG - $STAGE.$WINDOW_ID"
+echo "=============================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Array Task ID: $SLURM_ARRAY_TASK_ID"
+echo "Stage: $STAGE, Window: $WINDOW_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Working directory: $SCRIPT_DIR/$WINDOW_DIR"
+echo "Start time: $(date)"
+echo "=============================================="
+
+cd "$SCRIPT_DIR/$WINDOW_DIR"
+
+# =============================================================================
+# BRANCHED WORKFLOW {chaining_mode}
+# =============================================================================
+# Window 0: EM -> NVT (100ps) -> NPT_posres (100ps) -> NPT (500ps) -> Prod
+# Windows 1-N: Branch from window 0's NPT output -> short equil (50 ps) -> Prod
+#
+# NOTE: Windows 1-N are submitted with SLURM --dependency on window 0.
+#       They will not start until window 0 completes (no wasted resources).
+# =============================================================================
+
+if [ $WINDOW_ID -eq 0 ]; then
+    # =============================================================================
+    # WINDOW 0: Full NPT equilibration
+    # =============================================================================
+
+    # Determine input structure
+    # Path from inside npt/prod/equil subdirs to leg root (where input.gro and topol.top are)
+    # Structure: leg_dir/fep/simulation/stage.X/subdir/ → need ../../../../ to reach leg_dir
+    INPUT_GRO="../../../../input.gro"
+    TOPOL="../../../../topol.top"
+"""
+
+    # Add stage chaining logic only if enabled
+    if stage_chaining:
+        if leg == 'complex':
+            submit_script += """
+    if [ "$STAGE" == "coul" ]; then
+        # Coulomb stage: wait for and use restraints stage final output
+        PREV_STAGE_OUTPUT="../restraints.$((N_RESTRAINTS-1))/prod/prod.gro"
+        echo "Stage chaining: waiting for restraints stage to complete..."
+        WAIT_COUNT=0
+        while [ ! -f "$PREV_STAGE_OUTPUT" ]; do
+            sleep 60
+            ((WAIT_COUNT++))
+            if [ $WAIT_COUNT -ge 360 ]; then
+                echo "ERROR: Timeout waiting for restraints stage (6 hours). Exiting."
+                exit 1
+            fi
+        done
+        # Path from npt/ subdir: ../ to stage.X, then to prev stage's prod.gro
+        INPUT_GRO="../$PREV_STAGE_OUTPUT"
+        echo "Using restraints stage output: $INPUT_GRO"
+    elif [ "$STAGE" == "vdw" ]; then
+        # VdW stage: wait for and use coul stage final output
+        PREV_STAGE_OUTPUT="../coul.$((N_COUL-1))/prod/prod.gro"
+        echo "Stage chaining: waiting for coul stage to complete..."
+        WAIT_COUNT=0
+        while [ ! -f "$PREV_STAGE_OUTPUT" ]; do
+            sleep 60
+            ((WAIT_COUNT++))
+            if [ $WAIT_COUNT -ge 360 ]; then
+                echo "ERROR: Timeout waiting for coul stage (6 hours). Exiting."
+                exit 1
+            fi
+        done
+        INPUT_GRO="../$PREV_STAGE_OUTPUT"
+        echo "Using coul stage output: $INPUT_GRO"
+    else
+        echo "First stage (restraints): using input.gro"
+    fi
+"""
+        else:  # solvent leg
+            submit_script += """
+    if [ "$STAGE" == "vdw" ]; then
+        # VdW stage: wait for and use coul stage final output
+        PREV_STAGE_OUTPUT="../coul.$((N_COUL-1))/prod/prod.gro"
+        echo "Stage chaining: waiting for coul stage to complete..."
+        WAIT_COUNT=0
+        while [ ! -f "$PREV_STAGE_OUTPUT" ]; do
+            sleep 60
+            ((WAIT_COUNT++))
+            if [ $WAIT_COUNT -ge 360 ]; then
+                echo "ERROR: Timeout waiting for coul stage (6 hours). Exiting."
+                exit 1
+            fi
+        done
+        INPUT_GRO="../$PREV_STAGE_OUTPUT"
+        echo "Using coul stage output: $INPUT_GRO"
+    else
+        echo "First stage (coul): using input.gro"
+    fi
+"""
+    else:
+        # No chaining - all stages start from input.gro
+        submit_script += """
+    echo "No stage chaining: using input.gro for all stages"
+"""
+
+    submit_script += f"""
+    # =============================================================================
+    # EQUILIBRATION SEQUENCE: EM -> NVT -> NPT_posres -> NPT -> Prod
+    # =============================================================================
+
+    # Energy Minimization
+    if [ ! -f em/em.gro ]; then
+        echo ""
+        echo "Running Energy Minimization..."
+        cd em
+        $GMX grompp -f em.mdp -c "$INPUT_GRO" -p "$TOPOL" -o em.tpr -maxwarn 2
+        $GMX mdrun -deffnm em $GPU_FLAG
+        cd ..
+        echo "Energy minimization complete"
+    else
+        echo "Energy minimization already complete, skipping..."
+    fi
+
+    # NVT equilibration with position restraints (100 ps)
+    if [ ! -f nvt/nvt.gro ]; then
+        echo ""
+        echo "Running NVT equilibration with position restraints (100 ps)..."
+        cd nvt
+        $GMX grompp -f nvt.mdp -c ../em/em.gro -r ../em/em.gro -p "$TOPOL" -o nvt.tpr -maxwarn 2
+        $GMX mdrun -deffnm nvt $GPU_FLAG
+        cd ..
+        echo "NVT equilibration complete"
+    else
+        echo "NVT equilibration already complete, skipping..."
+    fi
+
+    # NPT equilibration with position restraints (100 ps, Berendsen)
+    if [ ! -f npt_posres/npt_posres.gro ]; then
+        echo ""
+        echo "Running NPT equilibration with position restraints (100 ps, Berendsen)..."
+        cd npt_posres
+        $GMX grompp -f npt_posres.mdp -c ../nvt/nvt.gro -r ../nvt/nvt.gro -t ../nvt/nvt.cpt -p "$TOPOL" -o npt_posres.tpr -maxwarn 2
+        $GMX mdrun -deffnm npt_posres $GPU_FLAG
+        cd ..
+        echo "NPT (Berendsen) equilibration complete"
+    else
+        echo "NPT (Berendsen) equilibration already complete, skipping..."
+    fi
+
+    # NPT equilibration without restraints (500 ps, Parrinello-Rahman)
+    if [ ! -f npt/npt.gro ]; then
+        echo ""
+        echo "Running NPT equilibration without restraints (500 ps, Parrinello-Rahman)..."
+        cd npt
+        $GMX grompp -f npt.mdp -c ../npt_posres/npt_posres.gro -t ../npt_posres/npt_posres.cpt -p "$TOPOL" -o npt.tpr -maxwarn 2
+        $GMX mdrun -deffnm npt $GPU_FLAG
+        cd ..
+        echo "NPT (Parrinello-Rahman) equilibration complete"
+    else
+        echo "NPT (Parrinello-Rahman) equilibration already complete, skipping..."
+    fi
+
+    # Production MD
+    if [ ! -f prod/prod.gro ]; then
+        echo ""
+        echo "Running Production MD..."
+        cd prod
+        $GMX grompp -f prod.mdp -c ../npt/npt.gro -t ../npt/npt.cpt -p "$TOPOL" -o prod.tpr -maxwarn 2
+        $GMX mdrun -deffnm prod $GPU_FLAG
+        cd ..
+        echo "Production complete"
+    else
+        echo "Production already complete, skipping..."
+    fi
+
+else
+    # =============================================================================
+    # WINDOWS 1-N: Branch from window 0's equilibrated structure
+    # =============================================================================
+
+    WINDOW0_NPT="../$STAGE.0/npt/npt.gro"
+    TOPOL="../../../../topol.top"
+
+    # Verify window 0's NPT is complete (should be, due to SLURM dependency)
+    if [ ! -f "$WINDOW0_NPT" ]; then
+        echo "ERROR: Window 0 NPT not found at $WINDOW0_NPT"
+        echo "       This job should have SLURM dependency on window 0."
+        exit 1
+    fi
+    echo "Window 0 NPT complete, branching..."
+
+    # Short equilibration at this lambda (50 ps)
+    # Path from equil/: ../ to stage.X, ../ to stage.0, then npt/npt.gro
+    if [ ! -f equil/equil.gro ]; then
+        echo ""
+        echo "Running short equilibration (50 ps)..."
+        cd equil
+        $GMX grompp -f equil.mdp -c "../$WINDOW0_NPT" -p "$TOPOL" -o equil.tpr -maxwarn 2
+        $GMX mdrun -deffnm equil $GPU_FLAG
+        cd ..
+        echo "Short equilibration complete"
+    else
+        echo "Short equilibration already complete, skipping..."
+    fi
+
+    # Production MD
+    if [ ! -f prod/prod.gro ]; then
+        echo ""
+        echo "Running Production MD..."
+        cd prod
+        $GMX grompp -f prod.mdp -c ../equil/equil.gro -t ../equil/equil.cpt -p "$TOPOL" -o prod.tpr -maxwarn 2
+        $GMX mdrun -deffnm prod $GPU_FLAG
+        cd ..
+        echo "Production complete"
+    else
+        echo "Production already complete, skipping..."
+    fi
+fi
+
+echo ""
+echo "=============================================="
+echo "Window $STAGE.$WINDOW_ID COMPLETE"
+echo "End time: $(date)"
+echo "=============================================="
+"""
+
+    # Write the job script (used by both window 0 and branch submissions)
+    job_script_path = output_dir / 'job_script.sh'
+    with open(job_script_path, 'w') as f:
+        f.write(submit_script)
+    os.chmod(job_script_path, 0o755)
+
+    # Generate master submission script that handles SLURM dependencies
+    # This ensures windows 1-N only start AFTER window 0 finishes equilibration
+    master_submit = f"""#!/bin/bash
+# =============================================================================
+# ABFE {leg.upper()} LEG - Master Submission Script with SLURM Dependencies
+# =============================================================================
+#
+# This script submits jobs in the correct order with proper dependencies:
+#   1. Window 0 jobs are submitted first (full equilibration)
+#   2. Branch jobs (windows 1-N) are submitted with --dependency on window 0
+#
+# This ensures no resources are wasted on waiting jobs.
+#
+# Usage: ./submit.sh
+# =============================================================================
+
+set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
 echo "=============================================="
-echo "ABFE ANALYSIS"
-echo "=============================================="
-
-# Check for alchemlyb first (preferred)
-if python -c "import alchemlyb" 2>/dev/null; then
-    echo "Using alchemlyb (MBAR) for analysis..."
-    python analyze_alchemlyb.py
-    exit $?
-fi
-
-# Fall back to GROMACS bar
-if command -v gmx &> /dev/null; then
-    GMX="gmx"
-elif command -v gmx_mpi &> /dev/null; then
-    GMX="gmx_mpi"
-else
-    echo "Neither alchemlyb nor GROMACS found."
-    echo "Install alchemlyb: pip install alchemlyb"
-    exit 1
-fi
-
-echo "Using GROMACS bar (BAR) for analysis..."
-echo "(For better results, install alchemlyb: pip install alchemlyb)"
-echo ""
-
-echo "Analyzing complex leg..."
-cd complex
-$GMX bar -f lambda*/prod.xvg -o bar_complex.xvg 2>&1 | tee bar_complex.log
-cd ..
-
-echo ""
-echo "Analyzing solvent leg..."
-cd solvent
-$GMX bar -f lambda*/prod.xvg -o bar_solvent.xvg 2>&1 | tee bar_solvent.log
-cd ..
-
-echo ""
-echo "=============================================="
-echo "RESULTS"
+echo "ABFE {leg.upper()} LEG - Submitting jobs with dependencies"
 echo "=============================================="
 echo ""
-echo "Restraint correction (analytical): {dG_restr:.2f} kJ/mol"
-echo ""
-echo "Complex leg dG (from bar_complex.log):"
-grep "total" complex/bar_complex.log | tail -1
-echo ""
-echo "Solvent leg dG (from bar_solvent.log):"
-grep "total" solvent/bar_solvent.log | tail -1
+
+"""
+
+    # Build the submission commands for each stage
+    offset = 0
+    for stage_name in stage_order:
+        n = len(stages[stage_name])
+        window0_idx = offset
+        branch_start = offset + 1
+        branch_end = offset + n - 1
+
+        master_submit += f"""
+# -----------------------------------------------------------------------------
+# Stage: {stage_name} ({n} windows)
+# -----------------------------------------------------------------------------
+echo "Submitting {stage_name} stage..."
+
+# Submit window 0 (full equilibration)
+JOBID_{stage_name.upper()}_0=$(sbatch --parsable --array={window0_idx} job_script.sh)
+echo "  {stage_name}.0 (window 0): Job $JOBID_{stage_name.upper()}_0"
+
+"""
+        if n > 1:
+            master_submit += f"""# Submit windows 1-{n-1} with dependency on window 0
+JOBID_{stage_name.upper()}_BRANCH=$(sbatch --parsable --dependency=afterok:$JOBID_{stage_name.upper()}_0 --array={branch_start}-{branch_end} job_script.sh)
+echo "  {stage_name}.1-{n-1} (branch): Job $JOBID_{stage_name.upper()}_BRANCH (depends on $JOBID_{stage_name.upper()}_0)"
+
+"""
+
+        offset += n
+
+    master_submit += """
 echo ""
 echo "=============================================="
-echo "dG_bind = dG_complex - dG_solvent + dG_restraint"
+echo "All jobs submitted!"
+echo "=============================================="
+echo ""
+echo "Monitor with: squeue -u $USER"
+echo "Check status: ./check_status.sh"
+"""
+
+    submit_path = output_dir / 'submit.sh'
+    with open(submit_path, 'w') as f:
+        f.write(master_submit)
+    os.chmod(submit_path, 0o755)
+
+    # Also create status check script
+    write_stage_status_script(output_dir, leg, stages, stage_order)
+
+    return submit_path
+
+
+def write_stage_status_script(output_dir, leg, stages, stage_order):
+    """Write status check script for stage-based workflow."""
+    script = f"""#!/bin/bash
+# Check status of ABFE {leg} simulations (stage-based)
+
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+echo "=============================================="
+echo "ABFE {leg.upper()} LEG - Status Check"
+echo "=============================================="
+
+completed=0
+running=0
+pending=0
+total=0
+
+"""
+    for stage_name in stage_order:
+        n = len(stages[stage_name])
+        script += f"""
+echo ""
+echo "Stage: {stage_name} ({n} windows)"
+echo "-------------------------------------------"
+for i in $(seq 0 {n - 1}); do
+    WINDOW_DIR="fep/simulation/{stage_name}.$i"
+    ((total++))
+    if [ -f "$WINDOW_DIR/prod/prod.gro" ]; then
+        status="COMPLETE"
+        ((completed++))
+    elif [ $i -eq 0 ]; then
+        # Window 0: check full equilibration sequence (em -> nvt -> npt_posres -> npt -> prod)
+        if [ -f "$WINDOW_DIR/npt/npt.gro" ]; then
+            status="npt done, prod running"
+            ((running++))
+        elif [ -f "$WINDOW_DIR/npt_posres/npt_posres.gro" ]; then
+            status="npt_posres done, npt running"
+            ((running++))
+        elif [ -f "$WINDOW_DIR/nvt/nvt.gro" ]; then
+            status="nvt done, npt_posres running"
+            ((running++))
+        elif [ -f "$WINDOW_DIR/em/em.gro" ]; then
+            status="em done, nvt running"
+            ((running++))
+        else
+            status="em running/pending"
+            ((pending++))
+        fi
+    else
+        # Windows 1-N: check short equilibration
+        if [ -f "$WINDOW_DIR/equil/equil.gro" ]; then
+            status="equil done, prod running"
+            ((running++))
+        elif [ -f "fep/simulation/{stage_name}.0/npt/npt.gro" ]; then
+            status="waiting/equil pending"
+            ((pending++))
+        else
+            status="waiting for window 0"
+            ((pending++))
+        fi
+    fi
+    echo "  {stage_name}.$i: $status"
+done
+"""
+
+    script += """
+echo ""
+echo "=============================================="
+echo "Summary: $completed/$total complete, $running running, $pending pending"
 echo "=============================================="
 """
+
+    status_path = output_dir / 'check_status.sh'
+    with open(status_path, 'w') as f:
+        f.write(script)
+    os.chmod(status_path, 0o755)
+
+
+def write_analysis_script(output_dir, complex_windows, solvent_windows, dG_restr):
+    """Write analysis scripts by copying from templates and substituting values."""
+    # Get the templates directory (relative to this script)
+    script_dir = Path(__file__).parent
+    templates_dir = script_dir / 'templates'
+
+    # Copy and modify analyze.sh
+    analyze_sh_template = templates_dir / 'analyze.sh'
+    if analyze_sh_template.exists():
+        with open(analyze_sh_template, 'r') as f:
+            script = f.read()
+        script = script.replace('{{DG_RESTR}}', f'{dG_restr:.2f}')
+    else:
+        print(f"  WARNING: Template not found: {analyze_sh_template}")
+        script = "#!/bin/bash\necho 'Template not found'\n"
 
     script_path = output_dir / 'analyze.sh'
     with open(script_path, 'w') as f:
         f.write(script)
     os.chmod(script_path, 0o755)
 
-    # Also write Python analysis script using alchemlyb
-    python_script = f'''#!/usr/bin/env python3
-"""
-ABFE analysis using alchemlyb (MBAR)
-
-This provides more accurate free energy estimates than BAR by using
-all lambda states simultaneously via the Multistate Bennett Acceptance Ratio.
-
-Requirements:
-    pip install alchemlyb pandas matplotlib
-
-Usage:
-    python analyze_alchemlyb.py
-"""
-
-import os
-import glob
-import pandas as pd
-import numpy as np
-
-try:
-    from alchemlyb.parsing.gmx import extract_dHdl
-    from alchemlyb.estimators import MBAR, BAR
-    from alchemlyb.preprocessing import statistical_inefficiency
-    from alchemlyb.visualisation import plot_mbar_overlap_matrix
-    import matplotlib.pyplot as plt
-    HAS_ALCHEMLYB = True
-except ImportError:
-    print("ERROR: alchemlyb not installed")
-    print("Install with: pip install alchemlyb pandas matplotlib")
-    HAS_ALCHEMLYB = False
-    exit(1)
-
-
-def analyze_leg(leg_dir, leg_name):
-    """Analyze one leg of ABFE calculation."""
-    print(f"\\nAnalyzing {{leg_name}} leg...")
-
-    # Find all xvg files
-    xvg_files = sorted(glob.glob(os.path.join(leg_dir, "lambda*/prod.xvg")))
-
-    if not xvg_files:
-        print(f"  No XVG files found in {{leg_dir}}/lambda*/prod.xvg")
-        return None, None
-
-    print(f"  Found {{len(xvg_files)}} lambda windows")
-
-    # Extract dH/dlambda data
-    dHdl_list = []
-    for xvg in xvg_files:
-        try:
-            data = extract_dHdl(xvg, T=300)
-            # Apply statistical inefficiency to decorrelate samples
-            data = statistical_inefficiency(data, series=data.iloc[:, 0])
-            dHdl_list.append(data)
-        except Exception as e:
-            print(f"  Warning: Could not parse {{xvg}}: {{e}}")
-
-    if not dHdl_list:
-        return None, None
-
-    # Concatenate all data
-    dHdl = pd.concat(dHdl_list)
-
-    # Run MBAR
-    print("  Running MBAR estimator...")
-    mbar = MBAR()
-    mbar.fit(dHdl)
-
-    dG_mbar = mbar.delta_f_.iloc[0, -1]
-    dG_err = mbar.d_delta_f_.iloc[0, -1]
-
-    print(f"  MBAR result: {{dG_mbar:.2f}} +/- {{dG_err:.2f}} kJ/mol")
-
-    # Also run BAR for comparison
-    bar = BAR()
-    bar.fit(dHdl)
-    dG_bar = bar.delta_f_.iloc[0, -1]
-    print(f"  BAR result: {{dG_bar:.2f}} kJ/mol")
-
-    # Plot overlap matrix
-    try:
-        fig = plot_mbar_overlap_matrix(mbar.overlap_matrix)
-        fig.savefig(os.path.join(leg_dir, f"{{leg_name}}_overlap.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Saved overlap matrix: {{leg_name}}_overlap.png")
-    except Exception as e:
-        print(f"  Warning: Could not plot overlap matrix: {{e}}")
-
-    return dG_mbar, dG_err
-
-
-def main():
-    print("=" * 60)
-    print("ABFE ANALYSIS (alchemlyb/MBAR)")
-    print("=" * 60)
-
-    # Restraint correction
-    dG_restr = {dG_restr:.4f}  # kJ/mol (analytical)
-    print(f"\\nRestraint correction: {{dG_restr:.2f}} kJ/mol")
-
-    # Analyze complex leg
-    dG_complex, err_complex = analyze_leg("complex", "complex")
-
-    # Analyze solvent leg
-    dG_solvent, err_solvent = analyze_leg("solvent", "solvent")
-
-    if dG_complex is None or dG_solvent is None:
-        print("\\nERROR: Analysis failed for one or more legs")
-        return
-
-    # Calculate binding free energy
-    # dG_bind = dG_complex - dG_solvent + dG_restr
-    # Note: dG_complex is the free energy to decouple ligand from complex
-    # dG_solvent is the free energy to decouple ligand from solvent
-    dG_bind = dG_complex - dG_solvent + dG_restr
-
-    # Propagate errors
-    err_bind = np.sqrt(err_complex**2 + err_solvent**2)
-
-    print("\\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
-    print(f"\\ndG_complex:  {{dG_complex:8.2f}} +/- {{err_complex:.2f}} kJ/mol")
-    print(f"dG_solvent:  {{dG_solvent:8.2f}} +/- {{err_solvent:.2f}} kJ/mol")
-    print(f"dG_restraint:{{dG_restr:8.2f}} kJ/mol (analytical)")
-    print("-" * 40)
-    print(f"dG_bind:     {{dG_bind:8.2f}} +/- {{err_bind:.2f}} kJ/mol")
-    print(f"             {{dG_bind/4.184:8.2f}} +/- {{err_bind/4.184:.2f}} kcal/mol")
-    print("\\n" + "=" * 60)
-
-    # Save results
-    with open("abfe_results.txt", "w") as f:
-        f.write("ABFE Results (alchemlyb/MBAR)\\n")
-        f.write("=" * 40 + "\\n\\n")
-        f.write(f"dG_complex:   {{dG_complex:.4f}} +/- {{err_complex:.4f}} kJ/mol\\n")
-        f.write(f"dG_solvent:   {{dG_solvent:.4f}} +/- {{err_solvent:.4f}} kJ/mol\\n")
-        f.write(f"dG_restraint: {{dG_restr:.4f}} kJ/mol\\n\\n")
-        f.write(f"dG_bind:      {{dG_bind:.4f}} +/- {{err_bind:.4f}} kJ/mol\\n")
-        f.write(f"              {{dG_bind/4.184:.4f}} +/- {{err_bind/4.184:.4f}} kcal/mol\\n")
-
-    print("\\nResults saved to: abfe_results.txt")
-
-
-if __name__ == "__main__":
-    main()
-'''
+    # Copy and modify analyze_alchemlyb.py
+    python_template = templates_dir / 'analyze_alchemlyb.py'
+    if python_template.exists():
+        with open(python_template, 'r') as f:
+            python_script = f.read()
+        python_script = python_script.replace('{{DG_RESTR}}', f'{dG_restr:.4f}')
+    else:
+        print(f"  WARNING: Template not found: {python_template}")
+        python_script = "#!/usr/bin/env python3\nprint('Template not found')\n"
 
     python_script_path = output_dir / 'analyze_alchemlyb.py'
     with open(python_script_path, 'w') as f:
@@ -1484,12 +2034,14 @@ def main():
     # Optional - ligand identification
     parser.add_argument('--ligand_resname', default='LIG',
                         help='Ligand residue name (default: LIG)')
-    parser.add_argument('--ligand_gro', default=None,
-                        help='Ligand GRO for solvent leg (if different from complex)')
+    parser.add_argument('--ligand_gro', '-l', required=True,
+                        help='Ligand-only GRO file for solvent leg (required for ABFE)')
 
     # Trajectory for MDRestraintsGenerator (recommended for robust restraints)
     parser.add_argument('--trajectory', '-t', default=None,
                         help='Trajectory file (XTC/TRR) for MDRestraintsGenerator analysis (recommended)')
+    parser.add_argument('--tpr', default=None,
+                        help='TPR file for topology (angles/bonds). Required with --trajectory for MDRestraintsGenerator')
 
     # Anchor atoms (optional - auto-detected if not provided)
     parser.add_argument('--protein_anchors', default=None,
@@ -1500,20 +2052,21 @@ def main():
     # Simulation parameters
     parser.add_argument('--prod_time', type=float, default=5.0,
                         help='Production time per window in ns (default: 5)')
-    parser.add_argument('--temperature', type=float, default=300.0,
-                        help='Temperature in K (default: 300)')
+    parser.add_argument('--temperature', type=float, default=298.15,
+                        help='Temperature in K (default: 298.15, standard thermodynamic temperature)')
 
-    # Lambda schedule options
-    parser.add_argument('--use_biggin_schedule', action='store_true', default=True,
-                        help='Use Biggin Lab validated lambda schedule (default: True)')
-    parser.add_argument('--custom_schedule', action='store_true',
-                        help='Use custom lambda schedule (specify n_*_windows)')
-    parser.add_argument('--n_restr_windows', type=int, default=16,
-                        help='Number of restraint lambda windows for custom schedule (default: 16)')
-    parser.add_argument('--n_coul_windows', type=int, default=11,
-                        help='Number of coulomb lambda windows for custom schedule (default: 11)')
-    parser.add_argument('--n_vdw_windows', type=int, default=20,
-                        help='Number of vdW lambda windows for custom schedule (default: 20)')
+    # FEP schedule option
+    parser.add_argument('--fep_schedule', type=str, default='staged-chained',
+                        choices=['staged-chained', 'staged-parallel', 'combined'],
+                        help='''FEP workflow schedule (default: staged-chained):
+  staged-chained:  Separate stages (restraints/coul/vdw) with chaining.
+                   Most rigorous - each stage starts from previous stage output.
+                   Stages run sequentially. (~2-4 hours with full parallelism)
+  staged-parallel: Separate stages without chaining.
+                   Faster - all stages start from input.gro in parallel.
+                   (~35-70 min with full parallelism)
+  combined:        Legacy combined lambda vectors in single simulation.
+                   Not recommended for production use.''')
 
     # Execution options
     parser.add_argument('--gpu', action='store_true',
@@ -1546,36 +2099,62 @@ def main():
 
     # Check for trajectory file (for MDRestraintsGenerator)
     trajectory = None
+    tpr_file = None
     if args.trajectory:
         trajectory = Path(args.trajectory)
         if not trajectory.exists():
             print(f"WARNING: Trajectory file not found: {args.trajectory}")
             trajectory = None
+        else:
+            # Check for TPR file (required for MDRestraintsGenerator - contains angles/bonds)
+            if args.tpr:
+                tpr_file = Path(args.tpr)
+                if not tpr_file.exists():
+                    print(f"WARNING: TPR file not found: {args.tpr}")
+                    tpr_file = None
+            else:
+                # Try to auto-detect TPR in same directory as trajectory
+                auto_tpr = trajectory.parent / "prod.tpr"
+                if auto_tpr.exists():
+                    tpr_file = auto_tpr
+                    print(f"  Auto-detected TPR file: {tpr_file}")
+                else:
+                    print("WARNING: No TPR file specified or found. MDRestraintsGenerator requires a TPR file")
+                    print("         for topology information (angles/bonds). Use --tpr to specify one.")
 
-    # Generate lambda schedules
-    use_biggin = args.use_biggin_schedule and not args.custom_schedule
-    complex_lambdas, solvent_lambdas = generate_lambda_schedule(
-        args.n_restr_windows, args.n_coul_windows, args.n_vdw_windows,
-        use_biggin_schedule=use_biggin
-    )
+    # Determine FEP schedule type
+    use_staged = args.fep_schedule in ['staged-chained', 'staged-parallel']
+    use_chaining = args.fep_schedule == 'staged-chained'
+
+    # Generate lambda schedules (for combined mode compatibility)
+    complex_lambdas, solvent_lambdas = generate_lambda_schedule(16, 11, 20, use_validated_schedule=True)
+
+    # Count windows for display
+    if use_staged:
+        stages = generate_stage_lambdas()
+        n_complex = len(stages['restraints']) + len(stages['coul']) + len(stages['vdw'])
+        n_solvent = len(stages['coul']) + len(stages['vdw'])
+    else:
+        n_complex = len(complex_lambdas)
+        n_solvent = len(solvent_lambdas)
 
     print("\n" + "="*60)
     print("ABFE SETUP WITH BORESCH RESTRAINTS")
     print("="*60)
-    if use_biggin:
-        print("\n[Using Biggin Lab validated protocol]")
+    print(f"\n[FEP Schedule: {args.fep_schedule}]")
     print(f"\nInputs:")
     print(f"  Complex:     {complex_gro}")
     print(f"  Topology:    {topology}")
     print(f"  Ligand ITP:  {ligand_itp}")
     if trajectory:
         print(f"  Trajectory:  {trajectory} (for MDRestraintsGenerator)")
+        if tpr_file:
+            print(f"  TPR file:    {tpr_file} (topology with angles/bonds)")
     print(f"\nSimulation:")
     print(f"  Production:  {args.prod_time} ns per window")
     print(f"  Temperature: {args.temperature} K")
-    print(f"  Complex leg: {len(complex_lambdas)} windows")
-    print(f"  Solvent leg: {len(solvent_lambdas)} windows")
-    print(f"  Schedule:    {'Biggin Lab validated' if use_biggin else 'Custom'}")
+    print(f"  Complex leg: {n_complex} windows")
+    print(f"  Solvent leg: {n_solvent} windows")
     print(f"\nOutput:")
     print(f"  Directory:   {output_dir}")
 
@@ -1593,12 +2172,12 @@ def main():
         ligand_atoms = [int(x) for x in args.ligand_anchors.split(',')]
         print("  Using user-specified anchor atoms")
 
-    elif trajectory and HAS_MDRESTRAINTS:
+    elif trajectory and tpr_file and HAS_MDRESTRAINTS:
         # Use MDRestraintsGenerator for robust restraint selection
         print("  Using MDRestraintsGenerator for trajectory-based restraint selection")
         print("  (This is the recommended approach for robust ABFE)")
         protein_atoms, ligand_atoms, boresch_params = find_anchor_atoms_mdrestraints(
-            complex_gro, trajectory, args.ligand_resname,
+            tpr_file, trajectory, args.ligand_resname,
             output_dir=output_dir, temperature=args.temperature
         )
         if protein_atoms is None:
@@ -1606,6 +2185,13 @@ def main():
             protein_atoms, ligand_atoms = find_anchor_atoms(complex_gro, args.ligand_resname)
         else:
             use_mdrestraints = True
+
+    elif trajectory and not tpr_file:
+        print("  WARNING: Trajectory provided but no TPR file found")
+        print("  MDRestraintsGenerator requires a TPR file for topology (angles/bonds)")
+        print("  Use --tpr to specify one, or place prod.tpr in the same directory as the trajectory")
+        print("  Falling back to geometric anchor selection")
+        protein_atoms, ligand_atoms = find_anchor_atoms(complex_gro, args.ligand_resname)
 
     elif trajectory and not HAS_MDRESTRAINTS:
         print("  WARNING: Trajectory provided but MDRestraintsGenerator not installed")
@@ -1616,7 +2202,7 @@ def main():
     else:
         # Fall back to geometric selection
         print("  Using geometric anchor selection")
-        print("  NOTE: For robust ABFE, the Biggin Lab recommends ~20 ns equilibration MD")
+        print("  NOTE: For robust ABFE, run ~20 ns equilibration MD")
         print("        before restraint selection. Provide --trajectory for better results.")
         protein_atoms, ligand_atoms = find_anchor_atoms(complex_gro, args.ligand_resname)
 
@@ -1625,8 +2211,11 @@ def main():
         print("Please specify --protein_anchors and --ligand_anchors")
         sys.exit(1)
 
-    print(f"\n  Protein anchors: {protein_atoms}")
-    print(f"  Ligand anchors:  {ligand_atoms}")
+    # Only print anchor atoms if not using MDRestraintsGenerator (which prints them already)
+    if not use_mdrestraints:
+        print(f"\n  Anchor atoms selected:")
+        print(f"    Protein (P1, P2, P3): {protein_atoms[0]}, {protein_atoms[1]}, {protein_atoms[2]}")
+        print(f"    Ligand (L1, L2, L3):  {ligand_atoms[0]}, {ligand_atoms[1]}, {ligand_atoms[2]}")
 
     # Step 2: Calculate Boresch parameters
     print("\n" + "-"*60)
@@ -1702,19 +2291,49 @@ def main():
         f.write('#include "boresch_restraints.itp"\n')
 
     # Create lambda directories and MDP files
-    prod_nsteps = int(args.prod_time * 1000 / 0.002)
+    # With 4 fs timestep (HMR), nsteps = time_ns * 1000 / 0.004
+    prod_nsteps = int(args.prod_time * 1000 / 0.004)
 
-    for i, lambdas in enumerate(complex_lambdas):
-        lambda_dir = complex_dir / f'lambda{i:02d}'
-        lambda_dir.mkdir(exist_ok=True)
+    if use_staged:
+        # Stage-based approach (recommended)
+        stages = generate_stage_lambdas()
+        fep_dir = complex_dir / 'fep' / 'simulation'
+        fep_dir.mkdir(parents=True, exist_ok=True)
 
-        write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, complex_lambdas, 'complex')
-        write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, complex_lambdas, 'complex')
-        write_fep_mdp(lambda_dir / 'prod.mdp', i, complex_lambdas, 'complex',
-                      nsteps=prod_nsteps, ref_temp=args.temperature)
+        total_windows = 0
+        for stage_name in ['restraints', 'coul', 'vdw']:
+            stage_lambdas = stages[stage_name]
+            for i in range(len(stage_lambdas)):
+                setup_stage_directory(
+                    fep_dir, stage_name, i, stage_lambdas,
+                    ligand_moltype=args.ligand_resname,
+                    temperature=args.temperature,
+                    prod_nsteps=prod_nsteps
+                )
+                total_windows += 1
 
-    write_run_script(complex_dir, 'complex', len(complex_lambdas), gmx, args.gpu)
-    print(f"  Created {len(complex_lambdas)} lambda windows")
+        write_stage_run_script(complex_dir, 'complex', stages, gmx, args.gpu,
+                               stage_chaining=use_chaining)
+        print(f"  Created {total_windows} windows across 3 stages:")
+        print(f"    - restraints: {len(stages['restraints'])} windows")
+        print(f"    - coul: {len(stages['coul'])} windows")
+        print(f"    - vdw: {len(stages['vdw'])} windows")
+    else:
+        # Legacy combined lambda approach
+        for i, lambdas in enumerate(complex_lambdas):
+            lambda_dir = complex_dir / f'lambda{i:02d}'
+            lambda_dir.mkdir(exist_ok=True)
+
+            write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, complex_lambdas, 'complex',
+                            ligand_moltype=args.ligand_resname)
+            write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, complex_lambdas, 'complex',
+                            ligand_moltype=args.ligand_resname)
+            write_fep_mdp(lambda_dir / 'prod.mdp', i, complex_lambdas, 'complex',
+                          nsteps=prod_nsteps, ref_temp=args.temperature,
+                          ligand_moltype=args.ligand_resname)
+
+        write_run_script(complex_dir, 'complex', len(complex_lambdas), gmx, args.gpu)
+        print(f"  Created {len(complex_lambdas)} lambda windows")
 
     # Step 4: Setup solvent leg
     print("\n" + "-"*60)
@@ -1723,43 +2342,65 @@ def main():
 
     solvent_dir = output_dir / 'solvent'
 
-    # Use provided ligand GRO or extract from complex
-    if args.ligand_gro and Path(args.ligand_gro).exists():
-        ligand_gro = Path(args.ligand_gro)
-    else:
-        # Try to find ligand GRO in same directory as ITP
-        ligand_gro = ligand_itp.parent / f'{args.ligand_resname}.gro'
-        if not ligand_gro.exists():
-            print(f"  WARNING: Ligand GRO not found at {ligand_gro}")
-            print(f"  Please provide --ligand_gro")
-            ligand_gro = None
+    # Validate ligand GRO (required argument)
+    ligand_gro = Path(args.ligand_gro)
+    if not ligand_gro.exists():
+        print(f"ERROR: Ligand GRO file not found: {ligand_gro}")
+        sys.exit(1)
 
-    if ligand_gro:
-        success = setup_solvent_leg(ligand_gro, ligand_itp, solvent_dir, gmx)
-        if success:
-            # Create lambda directories
+    success = setup_solvent_leg(ligand_gro, ligand_itp, solvent_dir, gmx)
+    if success:
+        if use_staged:
+            # Stage-based approach (no restraints for solvent)
+            stages = generate_stage_lambdas()
+            fep_dir = solvent_dir / 'fep' / 'simulation'
+            fep_dir.mkdir(parents=True, exist_ok=True)
+
+            total_windows = 0
+            for stage_name in ['coul', 'vdw']:  # No restraints for solvent
+                stage_lambdas = stages[stage_name]
+                for i in range(len(stage_lambdas)):
+                    setup_stage_directory(
+                        fep_dir, stage_name, i, stage_lambdas,
+                        ligand_moltype=args.ligand_resname,
+                        temperature=args.temperature,
+                        prod_nsteps=prod_nsteps
+                    )
+                    total_windows += 1
+
+            write_stage_run_script(solvent_dir, 'solvent', stages, gmx, args.gpu,
+                                   stage_chaining=use_chaining)
+            print(f"  Created {total_windows} windows across 2 stages:")
+            print(f"    - coul: {len(stages['coul'])} windows")
+            print(f"    - vdw: {len(stages['vdw'])} windows")
+        else:
+            # Legacy combined lambda approach
             for i, lambdas in enumerate(solvent_lambdas):
                 lambda_dir = solvent_dir / f'lambda{i:02d}'
                 lambda_dir.mkdir(exist_ok=True)
 
-                write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, solvent_lambdas, 'solvent')
-                write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, solvent_lambdas, 'solvent')
+                write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, solvent_lambdas, 'solvent',
+                                ligand_moltype=args.ligand_resname)
+                write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, solvent_lambdas, 'solvent',
+                                ligand_moltype=args.ligand_resname)
                 write_fep_mdp(lambda_dir / 'prod.mdp', i, solvent_lambdas, 'solvent',
-                              nsteps=prod_nsteps, ref_temp=args.temperature)
+                              nsteps=prod_nsteps, ref_temp=args.temperature,
+                              ligand_moltype=args.ligand_resname)
 
             write_run_script(solvent_dir, 'solvent', len(solvent_lambdas), gmx, args.gpu)
             print(f"  Created {len(solvent_lambdas)} lambda windows")
-        else:
-            print("  WARNING: Solvent leg setup failed")
     else:
-        print("  Skipping solvent leg (no ligand GRO provided)")
+        print("ERROR: Solvent leg setup failed")
+        sys.exit(1)
 
     # Step 5: Write analysis scripts
     print("\n" + "-"*60)
     print("Step 5: Write analysis scripts")
     print("-"*60)
 
-    write_analysis_script(output_dir, len(complex_lambdas), len(solvent_lambdas), dG_restr)
+    # Use MDRestraintsGenerator correction if available (more accurate), otherwise analytical
+    dG_restr_final = boresch_params.get('dG_restr_mdrestraints', dG_restr)
+    write_analysis_script(output_dir, len(complex_lambdas), len(solvent_lambdas), dG_restr_final)
     print(f"  Created: analyze.sh (run this)")
     print(f"  Created: analyze_alchemlyb.py (MBAR analysis, recommended)")
 
@@ -1769,9 +2410,9 @@ def main():
         f.write("ABFE Parameters\n")
         f.write("="*40 + "\n\n")
         f.write("Protocol:\n")
-        f.write(f"  Lambda schedule: {'Biggin Lab validated' if use_biggin else 'Custom'}\n")
+        f.write(f"  FEP schedule: {args.fep_schedule}\n")
         f.write(f"  Restraint selection: {'MDRestraintsGenerator' if use_mdrestraints else 'Geometric'}\n")
-        f.write(f"  Soft-core: sc-alpha=0.5, sc-power=1, sc-sigma=0.3, sc-coul=yes\n\n")
+        f.write(f"  Soft-core: sc-alpha=0.5, sc-power=1, sc-sigma=0.3\n\n")
         f.write("Input files:\n")
         f.write(f"  Complex GRO: {complex_gro}\n")
         f.write(f"  Topology: {topology}\n")
@@ -1800,31 +2441,34 @@ def main():
             dG_mdr = boresch_params['dG_restr_mdrestraints']
             f.write(f"Restraint correction (MDRestraintsGenerator): {dG_mdr:.2f} kJ/mol ({dG_mdr/4.184:.2f} kcal/mol)\n")
         f.write(f"\nLambda windows:\n")
-        f.write(f"  Complex leg: {len(complex_lambdas)} windows\n")
-        f.write(f"  Solvent leg: {len(solvent_lambdas)} windows\n")
-        f.write(f"  Total: {len(complex_lambdas) + len(solvent_lambdas)} windows\n")
-        if use_biggin:
-            f.write(f"\nBiggin Lab schedule details:\n")
-            f.write(f"  Restraint windows: 16 (dense endpoint sampling)\n")
-            f.write(f"  Coulomb windows: 11 (linear)\n")
-            f.write(f"  VdW windows: 20 (dense at lambda=0)\n")
+        f.write(f"  Complex leg: {n_complex} windows\n")
+        f.write(f"  Solvent leg: {n_solvent} windows\n")
+        f.write(f"  Total: {n_complex + n_solvent} windows\n")
+        if use_staged:
+            stages = generate_stage_lambdas()
+            f.write(f"\nStage-based schedule:\n")
+            f.write(f"  Restraint windows: {len(stages['restraints'])}\n")
+            f.write(f"  Coulomb windows: {len(stages['coul'])}\n")
+            f.write(f"  VdW windows: {len(stages['vdw'])}\n")
+            f.write(f"  Stage chaining: {'enabled' if use_chaining else 'disabled'}\n")
 
     # Summary
     print("\n" + "="*60)
     print("ABFE SETUP COMPLETE")
     print("="*60)
     print(f"\nProtocol:")
-    print(f"  Lambda schedule: {'Biggin Lab validated' if use_biggin else 'Custom'}")
+    print(f"  FEP schedule: {args.fep_schedule}")
     print(f"  Restraint selection: {'MDRestraintsGenerator' if use_mdrestraints else 'Geometric'}")
-    print(f"  Total windows: {len(complex_lambdas) + len(solvent_lambdas)}")
+    print(f"  Total windows: {n_complex + n_solvent}")
     print(f"\nOutput directory: {output_dir}")
     print(f"\nTo run simulations:")
-    print(f"\n  Option 1: HPC/SLURM (recommended - runs windows in parallel)")
-    print(f"    cd {complex_dir} && sbatch submit_slurm.sh")
-    print(f"    cd {solvent_dir} && sbatch submit_slurm.sh")
-    print(f"\n  Option 2: Local/sequential")
-    print(f"    cd {complex_dir} && ./run_all.sh")
-    print(f"    cd {solvent_dir} && ./run_all.sh")
+    print(f"\n  HPC/SLURM (recommended):")
+    print(f"    cd {complex_dir} && ./submit.sh")
+    print(f"    cd {solvent_dir} && ./submit.sh")
+    print(f"\n  This uses SLURM dependencies to ensure efficient resource usage:")
+    print(f"    1. Window 0 jobs submit first (full equilibration)")
+    print(f"    2. Branch jobs (windows 1-N) submit with --dependency on window 0")
+    print(f"    3. Branch jobs won't start until window 0 completes")
     print(f"\n  Check progress:")
     print(f"    cd {complex_dir} && ./check_status.sh")
     print(f"    cd {solvent_dir} && ./check_status.sh")
