@@ -4,8 +4,8 @@
 ; RUN CONTROL
 ;----------------------------------------------------
 integrator   = sd
-nsteps       = 125000        ; 500 ps
-dt           = 0.004
+nsteps       = 250000        ; 500 ps
+dt           = 0.002
 comm-mode    = Linear
 nstcomm      = 50
 
@@ -25,7 +25,7 @@ nstcalcenergy          = 50
 ; BONDS
 ;----------------------------------------------------
 constraint_algorithm   = lincs
-constraints            = all-bonds
+constraints            = h-bonds
 lincs-iter             = 1
 lincs-order            = 6
 lincs-warnangle        = 30
@@ -92,4 +92,4 @@ nstdhdl                  = 100
 dhdl-print-energy        = total
 calc-lambda-neighbors    = -1
 separate-dhdl-file       = yes
-couple-intramol          = yes
+couple-intramol          = no

@@ -174,6 +174,53 @@ def add_residue_to_residuetypes(output_dir: Path, residue_name: str, residue_typ
     print(f"  Added {residue_name} as {residue_type} to residuetypes.dat")
 
 
+def add_hdb_entry_to_forcefield(ff_dir: Path, residue_name: str) -> bool:
+    """
+    Add an HDB entry for the custom residue to tell pdb2gmx how to build
+    missing backbone hydrogen H.
+
+    The HDB format is:
+        RESIDUE_NAME  NUM_ADD_GROUPS
+        num_H  type  name  atom  [bonded atoms for geometry...]
+
+    For CYL residues, we only define H since ligand hydrogens are in the PDB.
+
+    Args:
+        ff_dir: Path to force field directory
+        residue_name: Name of the custom residue (e.g., CYL, CC2)
+
+    Returns:
+        True if added successfully, False if already exists
+    """
+    hdb_file = ff_dir / 'aminoacids.hdb'
+    if not hdb_file.exists():
+        print(f"  WARNING: aminoacids.hdb not found in {ff_dir}")
+        return False
+
+    with open(hdb_file) as f:
+        content = f.read()
+
+    # Check if residue already exists
+    if f'\n{residue_name}\t' in content or content.startswith(f'{residue_name}\t'):
+        print(f"  Residue {residue_name} already exists in {hdb_file.name}")
+        return False
+
+    # Add HDB entry for the custom residue
+    # Only define backbone H - ligand hydrogens are in the input PDB
+    # Format: num_H type H_name bonded_atom geometry_atoms...
+    # Type 1 = single H with angle
+    hdb_entry = f"""
+{residue_name}\t1
+1\t1\tH\tN\t-C\tCA
+"""
+
+    # Append the new residue
+    with open(hdb_file, 'a') as f:
+        f.write(hdb_entry)
+
+    return True
+
+
 def add_rtp_entry_to_forcefield(ff_dir: Path, rtp_content: str, residue_name: str) -> bool:
     """
     Add an RTP entry to the force field's aminoacids.rtp file.
@@ -1190,6 +1237,14 @@ For RBFE (CYL1 -> CYL2):
         print(f"  Successfully added {args.residue_name} to aminoacids.rtp")
     else:
         print(f"  {args.residue_name} already exists in aminoacids.rtp")
+
+    # Add HDB entry so pdb2gmx can build backbone H
+    print(f"  Adding {args.residue_name} to {ff_dir}/aminoacids.hdb...")
+    hdb_added = add_hdb_entry_to_forcefield(ff_dir, args.residue_name)
+    if hdb_added:
+        print(f"  Successfully added {args.residue_name} to aminoacids.hdb")
+    else:
+        print(f"  {args.residue_name} already exists in aminoacids.hdb (or hdb not found)")
 
     # Add residue to residuetypes.dat so pdb2gmx recognizes it as a protein residue
     add_residue_to_residuetypes(output_dir, args.residue_name, "Protein")

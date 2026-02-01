@@ -5,7 +5,7 @@
 ;----------------------------------------------------
 integrator   = sd
 nsteps       = {{NSTEPS}}
-dt           = 0.004
+dt           = 0.002
 comm-mode    = Linear
 nstcomm      = 50
 
@@ -25,9 +25,9 @@ nstcalcenergy          = 50
 ; BONDS
 ;----------------------------------------------------
 constraint_algorithm   = lincs
-constraints            = all-bonds
-lincs_iter             = 1
-lincs_order            = 6
+constraints            = h-bonds
+lincs-iter             = 1
+lincs-order            = 6
 lincs-warnangle        = 30
 continuation           = yes
 
@@ -94,4 +94,4 @@ nstdhdl                  = 100
 dhdl-print-energy        = total
 calc-lambda-neighbors    = -1
 separate-dhdl-file       = yes
-couple-intramol          = yes
+couple-intramol          = no

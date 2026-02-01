@@ -822,7 +822,7 @@ def setup_stage_directory(base_dir, stage, state, lambdas, ligand_moltype='LIG',
         lambdas: Full list of lambda values for this stage
         ligand_moltype: Molecule type name
         temperature: Reference temperature
-        prod_nsteps: Production steps (default 2.5M = 10 ns at 4 fs)
+        prod_nsteps: Production steps (default 5M = 10 ns at 2 fs)
 
     Returns:
         Path to created directory
@@ -1342,7 +1342,7 @@ echo "=============================================="
 
 # Load GROMACS module (LUMI)
 module use /appl/local/csc/modulefiles
-module load gromacs/2025.4-gpu
+module load gromacs/2026.0-gpu
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export OMP_PLACES=cores
@@ -1546,7 +1546,7 @@ cd "$SCRIPT_DIR"
 
 # Load GROMACS module (LUMI)
 module use /appl/local/csc/modulefiles
-module load gromacs/2025.4-gpu
+module load gromacs/2026.0-gpu
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export OMP_PLACES=cores
@@ -2015,6 +2015,205 @@ def write_analysis_script(output_dir, complex_windows, solvent_windows, dG_restr
     return script_path
 
 
+def write_master_analysis_script(output_dir, n_replicates, ligand_name, dG_restr):
+    """Write master analysis scripts that aggregate results across replicates."""
+
+    # Write analyze_all.sh (bash wrapper)
+    analyze_all_sh = f'''#!/bin/bash
+# Master ABFE analysis script - aggregates results across replicates
+# Outputs mean and standard error in Biggin lab format
+
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+echo "=============================================="
+echo "ABFE ANALYSIS - ALL REPLICATES"
+echo "=============================================="
+echo ""
+echo "Ligand: {ligand_name}"
+echo "Replicates: {n_replicates}"
+echo ""
+
+# Check for alchemlyb first (preferred)
+if python -c "import alchemlyb" 2>/dev/null; then
+    echo "Using alchemlyb (MBAR) for analysis..."
+    python analyze_all.py
+    exit $?
+fi
+
+echo "ERROR: alchemlyb not installed"
+echo "Install with: pip install alchemlyb pandas numpy"
+exit 1
+'''
+
+    script_path = output_dir / 'analyze_all.sh'
+    with open(script_path, 'w') as f:
+        f.write(analyze_all_sh)
+    os.chmod(script_path, 0o755)
+
+    # Write analyze_all.py (Python aggregation script)
+    analyze_all_py = f'''#!/usr/bin/env python3
+"""
+Master ABFE analysis - aggregates results across replicates
+
+Runs analysis for each replicate, then calculates mean and standard error.
+Outputs in Biggin lab format: ligand  ABFE_mean  ABFE_err  nreplicates
+"""
+
+import os
+import sys
+import subprocess
+import numpy as np
+import re
+
+# Configuration
+LIGAND_NAME = "{ligand_name}"
+N_REPLICATES = {n_replicates}
+DG_RESTR = {dG_restr:.4f}  # kJ/mol
+
+
+def run_replicate_analysis(rep_dir):
+    """Run analysis for a single replicate and parse results."""
+    results_file = os.path.join(rep_dir, "abfe_results.txt")
+
+    # Check if analysis has already been run
+    if not os.path.exists(results_file):
+        # Run the analysis
+        print(f"  Running analysis in {{rep_dir}}...")
+        analyze_script = os.path.join(rep_dir, "analyze_alchemlyb.py")
+        if os.path.exists(analyze_script):
+            result = subprocess.run(
+                ["python", analyze_script],
+                cwd=rep_dir,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                print(f"    WARNING: Analysis failed for {{rep_dir}}")
+                print(result.stderr)
+                return None, None
+        else:
+            print(f"    WARNING: No analysis script found in {{rep_dir}}")
+            return None, None
+
+    # Parse results
+    if not os.path.exists(results_file):
+        print(f"    WARNING: No results file found in {{rep_dir}}")
+        return None, None
+
+    with open(results_file, 'r') as f:
+        content = f.read()
+
+    # Look for dG_bind line: "dG_bind:      X.XXXX +/- Y.YYYY kJ/mol"
+    match = re.search(r'dG_bind:\\s+([\\d.-]+)\\s+\\+/-\\s+([\\d.]+)\\s+kJ/mol', content)
+    if match:
+        dG = float(match.group(1))
+        dG_err = float(match.group(2))
+        return dG, dG_err
+    else:
+        print(f"    WARNING: Could not parse dG_bind from {{results_file}}")
+        return None, None
+
+
+def main():
+    print("=" * 60)
+    print("ABFE ANALYSIS - AGGREGATE REPLICATES")
+    print("=" * 60)
+    print(f"\\nLigand: {{LIGAND_NAME}}")
+    print(f"Replicates: {{N_REPLICATES}}")
+    print(f"Restraint correction: {{DG_RESTR:.2f}} kJ/mol")
+    print()
+
+    # Collect results from each replicate
+    dG_values = []
+    dG_errors = []
+    successful_reps = []
+
+    for rep in range(1, N_REPLICATES + 1):
+        rep_dir = str(rep)
+        print(f"\\nReplicate {{rep}}:")
+
+        if not os.path.isdir(rep_dir):
+            print(f"  WARNING: Directory {{rep_dir}}/ not found, skipping")
+            continue
+
+        dG, dG_err = run_replicate_analysis(rep_dir)
+
+        if dG is not None:
+            dG_values.append(dG)
+            dG_errors.append(dG_err)
+            successful_reps.append(rep)
+            print(f"  dG_bind = {{dG:.2f}} +/- {{dG_err:.2f}} kJ/mol")
+        else:
+            print(f"  FAILED - no valid result")
+
+    if len(dG_values) == 0:
+        print("\\nERROR: No successful replicate analyses")
+        sys.exit(1)
+
+    # Calculate statistics
+    dG_mean = np.mean(dG_values)
+    n = len(dG_values)
+
+    if n > 1:
+        # Standard error of the mean (SEM)
+        dG_sem = np.std(dG_values, ddof=1) / np.sqrt(n)
+    else:
+        # With only one replicate, use the MBAR error
+        dG_sem = dG_errors[0]
+
+    # Convert to kcal/mol
+    dG_mean_kcal = dG_mean / 4.184
+    dG_sem_kcal = dG_sem / 4.184
+
+    # Print results
+    print("\\n" + "=" * 60)
+    print("AGGREGATE RESULTS")
+    print("=" * 60)
+    print(f"\\nSuccessful replicates: {{n}} of {{N_REPLICATES}}")
+    print(f"\\nIndividual dG_bind values (kJ/mol):")
+    for rep, dG in zip(successful_reps, dG_values):
+        print(f"  Replicate {{rep}}: {{dG:.2f}} kJ/mol")
+
+    print(f"\\nMean dG_bind: {{dG_mean:.2f}} +/- {{dG_sem:.2f}} kJ/mol")
+    print(f"              {{dG_mean_kcal:.2f}} +/- {{dG_sem_kcal:.2f}} kcal/mol")
+
+    print("\\n" + "=" * 60)
+    print("BIGGIN LAB FORMAT")
+    print("=" * 60)
+    print(f"\\n# ligand  ABFE_mean(kcal/mol)  ABFE_err  nreplicates")
+    print(f"{{LIGAND_NAME}}  {{dG_mean_kcal:.2f}}  {{dG_sem_kcal:.2f}}  {{n}}")
+    print()
+
+    # Save aggregate results
+    with open("abfe_aggregate_results.txt", "w") as f:
+        f.write("ABFE Aggregate Results\\n")
+        f.write("=" * 40 + "\\n\\n")
+        f.write(f"Ligand: {{LIGAND_NAME}}\\n")
+        f.write(f"Successful replicates: {{n}} of {{N_REPLICATES}}\\n\\n")
+        f.write("Individual results (kJ/mol):\\n")
+        for rep, dG, err in zip(successful_reps, dG_values, dG_errors):
+            f.write(f"  Replicate {{rep}}: {{dG:.4f}} +/- {{err:.4f}}\\n")
+        f.write(f"\\nAggregate (mean +/- SEM):\\n")
+        f.write(f"  dG_bind: {{dG_mean:.4f}} +/- {{dG_sem:.4f}} kJ/mol\\n")
+        f.write(f"           {{dG_mean_kcal:.4f}} +/- {{dG_sem_kcal:.4f}} kcal/mol\\n")
+        f.write(f"\\n# Biggin lab format:\\n")
+        f.write(f"# ligand  ABFE_mean(kcal/mol)  ABFE_err  nreplicates\\n")
+        f.write(f"{{LIGAND_NAME}}  {{dG_mean_kcal:.4f}}  {{dG_sem_kcal:.4f}}  {{n}}\\n")
+
+    print("Results saved to: abfe_aggregate_results.txt")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    python_script_path = output_dir / 'analyze_all.py'
+    with open(python_script_path, 'w') as f:
+        f.write(analyze_all_py)
+    os.chmod(python_script_path, 0o755)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Setup ABFE calculations with Boresch restraints",
@@ -2073,6 +2272,10 @@ def main():
                         help='Use GPU acceleration')
     parser.add_argument('--gmx', default=None,
                         help='GROMACS executable')
+
+    # Replicate options
+    parser.add_argument('--repeats', '-r', type=int, default=3,
+                        help='Number of independent replicates (default: 3)')
 
     args = parser.parse_args()
 
@@ -2155,6 +2358,7 @@ def main():
     print(f"  Temperature: {args.temperature} K")
     print(f"  Complex leg: {n_complex} windows")
     print(f"  Solvent leg: {n_solvent} windows")
+    print(f"  Replicates:  {args.repeats}")
     print(f"\nOutput:")
     print(f"  Directory:   {output_dir}")
 
@@ -2252,112 +2456,81 @@ def main():
         dG_mdr = boresch_params['dG_restr_mdrestraints']
         print(f"  Restraint correction (MDRestraintsGenerator): {dG_mdr:.2f} kJ/mol ({dG_mdr/4.184:.2f} kcal/mol)")
 
-    # Step 3: Setup complex leg
-    print("\n" + "-"*60)
-    print("Step 3: Setup complex leg")
-    print("-"*60)
+    # Use MDRestraintsGenerator correction if available (more accurate), otherwise analytical
+    dG_restr_final = boresch_params.get('dG_restr_mdrestraints', dG_restr)
 
-    complex_dir = output_dir / 'complex'
-    complex_dir.mkdir(exist_ok=True)
+    # Derive ligand name from output directory or ligand ITP
+    ligand_name = output_dir.name
+    if ligand_name.startswith('ABFE'):
+        # Try to get from ligand ITP
+        ligand_name = ligand_itp.stem  # e.g., LIG from LIG.itp
 
-    # Copy input files
-    # Copy input files (skip if same file)
-    input_gro_dst = complex_dir / 'input.gro'
-    if complex_gro.resolve() != input_gro_dst.resolve():
-        shutil.copy(complex_gro, input_gro_dst)
-    topol_dst = complex_dir / 'topol.top'
-    if topology.resolve() != topol_dst.resolve():
-        shutil.copy(topology, topol_dst)
+    # ==================================================================
+    # REPLICATE LOOP - Steps 3-5 run for each replicate
+    # ==================================================================
+    n_replicates = args.repeats
 
-    # Copy ITP files (skip if same file)
-    top_dir = topology.parent
-    with open(topology) as f:
-        for line in f:
-            if '#include' in line and '"' in line:
-                itp_name = line.split('"')[1]
-                itp_path = top_dir / itp_name
-                dst_path = complex_dir / itp_name
-                if itp_path.exists() and itp_path.resolve() != dst_path.resolve():
-                    shutil.copy(itp_path, dst_path)
+    for rep_num in range(1, n_replicates + 1):
+        print("\n" + "="*60)
+        print(f"REPLICATE {rep_num} of {n_replicates}")
+        print("="*60)
 
-    # Write restraint ITP
-    restr_itp = complex_dir / 'boresch_restraints.itp'
-    write_restraint_itp(restr_itp, boresch_params)
-    print(f"  Created: boresch_restraints.itp")
+        # Create replicate directory
+        rep_dir = output_dir / str(rep_num)
+        rep_dir.mkdir(parents=True, exist_ok=True)
 
-    # Add restraint include to topology
-    with open(complex_dir / 'topol.top', 'a') as f:
-        f.write('\n; Include Boresch restraints\n')
-        f.write('#include "boresch_restraints.itp"\n')
+        # Random seed for this replicate (ensures independent sampling)
+        random_seed = rep_num * 12345  # Different seed per replicate
 
-    # Create lambda directories and MDP files
-    # With 4 fs timestep (HMR), nsteps = time_ns * 1000 / 0.004
-    prod_nsteps = int(args.prod_time * 1000 / 0.004)
+        # Step 3: Setup complex leg
+        print("\n" + "-"*60)
+        print(f"Step 3: Setup complex leg (replicate {rep_num})")
+        print("-"*60)
 
-    if use_staged:
-        # Stage-based approach (recommended)
-        stages = generate_stage_lambdas()
-        fep_dir = complex_dir / 'fep' / 'simulation'
-        fep_dir.mkdir(parents=True, exist_ok=True)
+        complex_dir = rep_dir / 'complex'
+        complex_dir.mkdir(exist_ok=True)
 
-        total_windows = 0
-        for stage_name in ['restraints', 'coul', 'vdw']:
-            stage_lambdas = stages[stage_name]
-            for i in range(len(stage_lambdas)):
-                setup_stage_directory(
-                    fep_dir, stage_name, i, stage_lambdas,
-                    ligand_moltype=args.ligand_resname,
-                    temperature=args.temperature,
-                    prod_nsteps=prod_nsteps
-                )
-                total_windows += 1
+        # Copy input files (skip if same file)
+        input_gro_dst = complex_dir / 'input.gro'
+        if complex_gro.resolve() != input_gro_dst.resolve():
+            shutil.copy(complex_gro, input_gro_dst)
+        topol_dst = complex_dir / 'topol.top'
+        if topology.resolve() != topol_dst.resolve():
+            shutil.copy(topology, topol_dst)
 
-        write_stage_run_script(complex_dir, 'complex', stages, gmx, args.gpu,
-                               stage_chaining=use_chaining)
-        print(f"  Created {total_windows} windows across 3 stages:")
-        print(f"    - restraints: {len(stages['restraints'])} windows")
-        print(f"    - coul: {len(stages['coul'])} windows")
-        print(f"    - vdw: {len(stages['vdw'])} windows")
-    else:
-        # Legacy combined lambda approach
-        for i, lambdas in enumerate(complex_lambdas):
-            lambda_dir = complex_dir / f'lambda{i:02d}'
-            lambda_dir.mkdir(exist_ok=True)
+        # Copy ITP files (skip if same file)
+        top_dir = topology.parent
+        with open(topology) as f:
+            for line in f:
+                if '#include' in line and '"' in line:
+                    itp_name = line.split('"')[1]
+                    itp_path = top_dir / itp_name
+                    dst_path = complex_dir / itp_name
+                    if itp_path.exists() and itp_path.resolve() != dst_path.resolve():
+                        shutil.copy(itp_path, dst_path)
 
-            write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, complex_lambdas, 'complex',
-                            ligand_moltype=args.ligand_resname)
-            write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, complex_lambdas, 'complex',
-                            ligand_moltype=args.ligand_resname)
-            write_fep_mdp(lambda_dir / 'prod.mdp', i, complex_lambdas, 'complex',
-                          nsteps=prod_nsteps, ref_temp=args.temperature,
-                          ligand_moltype=args.ligand_resname)
+        # Write restraint ITP
+        restr_itp = complex_dir / 'boresch_restraints.itp'
+        write_restraint_itp(restr_itp, boresch_params)
+        print(f"  Created: boresch_restraints.itp")
 
-        write_run_script(complex_dir, 'complex', len(complex_lambdas), gmx, args.gpu)
-        print(f"  Created {len(complex_lambdas)} lambda windows")
+        # Add restraint include to topology
+        with open(complex_dir / 'topol.top', 'a') as f:
+            f.write('\n; Include Boresch restraints\n')
+            f.write('#include "boresch_restraints.itp"\n')
 
-    # Step 4: Setup solvent leg
-    print("\n" + "-"*60)
-    print("Step 4: Setup solvent leg")
-    print("-"*60)
+        # Create lambda directories and MDP files
+        # With 2 fs timestep, nsteps = time_ns * 1000 / 0.002
+        prod_nsteps = int(args.prod_time * 1000 / 0.002)
 
-    solvent_dir = output_dir / 'solvent'
-
-    # Validate ligand GRO (required argument)
-    ligand_gro = Path(args.ligand_gro)
-    if not ligand_gro.exists():
-        print(f"ERROR: Ligand GRO file not found: {ligand_gro}")
-        sys.exit(1)
-
-    success = setup_solvent_leg(ligand_gro, ligand_itp, solvent_dir, gmx)
-    if success:
         if use_staged:
-            # Stage-based approach (no restraints for solvent)
+            # Stage-based approach (recommended)
             stages = generate_stage_lambdas()
-            fep_dir = solvent_dir / 'fep' / 'simulation'
+            fep_dir = complex_dir / 'fep' / 'simulation'
             fep_dir.mkdir(parents=True, exist_ok=True)
 
             total_windows = 0
-            for stage_name in ['coul', 'vdw']:  # No restraints for solvent
+            for stage_name in ['restraints', 'coul', 'vdw']:
                 stage_lambdas = stages[stage_name]
                 for i in range(len(stage_lambdas)):
                     setup_stage_directory(
@@ -2368,41 +2541,111 @@ def main():
                     )
                     total_windows += 1
 
-            write_stage_run_script(solvent_dir, 'solvent', stages, gmx, args.gpu,
+            write_stage_run_script(complex_dir, 'complex', stages, gmx, args.gpu,
                                    stage_chaining=use_chaining)
-            print(f"  Created {total_windows} windows across 2 stages:")
+            print(f"  Created {total_windows} windows across 3 stages:")
+            print(f"    - restraints: {len(stages['restraints'])} windows")
             print(f"    - coul: {len(stages['coul'])} windows")
             print(f"    - vdw: {len(stages['vdw'])} windows")
         else:
             # Legacy combined lambda approach
-            for i, lambdas in enumerate(solvent_lambdas):
-                lambda_dir = solvent_dir / f'lambda{i:02d}'
+            for i, lambdas in enumerate(complex_lambdas):
+                lambda_dir = complex_dir / f'lambda{i:02d}'
                 lambda_dir.mkdir(exist_ok=True)
 
-                write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, solvent_lambdas, 'solvent',
+                write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, complex_lambdas, 'complex',
                                 ligand_moltype=args.ligand_resname)
-                write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, solvent_lambdas, 'solvent',
+                write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, complex_lambdas, 'complex',
                                 ligand_moltype=args.ligand_resname)
-                write_fep_mdp(lambda_dir / 'prod.mdp', i, solvent_lambdas, 'solvent',
+                write_fep_mdp(lambda_dir / 'prod.mdp', i, complex_lambdas, 'complex',
                               nsteps=prod_nsteps, ref_temp=args.temperature,
                               ligand_moltype=args.ligand_resname)
 
-            write_run_script(solvent_dir, 'solvent', len(solvent_lambdas), gmx, args.gpu)
-            print(f"  Created {len(solvent_lambdas)} lambda windows")
-    else:
-        print("ERROR: Solvent leg setup failed")
-        sys.exit(1)
+            write_run_script(complex_dir, 'complex', len(complex_lambdas), gmx, args.gpu)
+            print(f"  Created {len(complex_lambdas)} lambda windows")
 
-    # Step 5: Write analysis scripts
+        # Step 4: Setup solvent leg
+        print("\n" + "-"*60)
+        print(f"Step 4: Setup solvent leg (replicate {rep_num})")
+        print("-"*60)
+
+        solvent_dir = rep_dir / 'solvent'
+
+        # Validate ligand GRO (required argument) - only on first replicate
+        if rep_num == 1:
+            ligand_gro = Path(args.ligand_gro)
+            if not ligand_gro.exists():
+                print(f"ERROR: Ligand GRO file not found: {ligand_gro}")
+                sys.exit(1)
+        else:
+            ligand_gro = Path(args.ligand_gro)
+
+        success = setup_solvent_leg(ligand_gro, ligand_itp, solvent_dir, gmx)
+        if success:
+            if use_staged:
+                # Stage-based approach (no restraints for solvent)
+                stages = generate_stage_lambdas()
+                fep_dir = solvent_dir / 'fep' / 'simulation'
+                fep_dir.mkdir(parents=True, exist_ok=True)
+
+                total_windows = 0
+                for stage_name in ['coul', 'vdw']:  # No restraints for solvent
+                    stage_lambdas = stages[stage_name]
+                    for i in range(len(stage_lambdas)):
+                        setup_stage_directory(
+                            fep_dir, stage_name, i, stage_lambdas,
+                            ligand_moltype=args.ligand_resname,
+                            temperature=args.temperature,
+                            prod_nsteps=prod_nsteps
+                        )
+                        total_windows += 1
+
+                write_stage_run_script(solvent_dir, 'solvent', stages, gmx, args.gpu,
+                                       stage_chaining=use_chaining)
+                print(f"  Created {total_windows} windows across 2 stages:")
+                print(f"    - coul: {len(stages['coul'])} windows")
+                print(f"    - vdw: {len(stages['vdw'])} windows")
+            else:
+                # Legacy combined lambda approach
+                for i, lambdas in enumerate(solvent_lambdas):
+                    lambda_dir = solvent_dir / f'lambda{i:02d}'
+                    lambda_dir.mkdir(exist_ok=True)
+
+                    write_equil_mdp(lambda_dir / 'nvt.mdp', 'nvt', i, solvent_lambdas, 'solvent',
+                                    ligand_moltype=args.ligand_resname)
+                    write_equil_mdp(lambda_dir / 'npt.mdp', 'npt', i, solvent_lambdas, 'solvent',
+                                    ligand_moltype=args.ligand_resname)
+                    write_fep_mdp(lambda_dir / 'prod.mdp', i, solvent_lambdas, 'solvent',
+                                  nsteps=prod_nsteps, ref_temp=args.temperature,
+                                  ligand_moltype=args.ligand_resname)
+
+                write_run_script(solvent_dir, 'solvent', len(solvent_lambdas), gmx, args.gpu)
+                print(f"  Created {len(solvent_lambdas)} lambda windows")
+        else:
+            print("ERROR: Solvent leg setup failed")
+            sys.exit(1)
+
+        # Step 5: Write analysis scripts for this replicate
+        print("\n" + "-"*60)
+        print(f"Step 5: Write analysis scripts (replicate {rep_num})")
+        print("-"*60)
+
+        write_analysis_script(rep_dir, len(complex_lambdas), len(solvent_lambdas), dG_restr_final)
+        print(f"  Created: {rep_num}/analyze.sh")
+        print(f"  Created: {rep_num}/analyze_alchemlyb.py")
+
+    # ==================================================================
+    # END REPLICATE LOOP - Now write master analysis script
+    # ==================================================================
+
+    # Step 6: Write master analysis script for all replicates
     print("\n" + "-"*60)
-    print("Step 5: Write analysis scripts")
+    print("Step 6: Write master analysis script")
     print("-"*60)
 
-    # Use MDRestraintsGenerator correction if available (more accurate), otherwise analytical
-    dG_restr_final = boresch_params.get('dG_restr_mdrestraints', dG_restr)
-    write_analysis_script(output_dir, len(complex_lambdas), len(solvent_lambdas), dG_restr_final)
-    print(f"  Created: analyze.sh (run this)")
-    print(f"  Created: analyze_alchemlyb.py (MBAR analysis, recommended)")
+    write_master_analysis_script(output_dir, n_replicates, ligand_name, dG_restr_final)
+    print(f"  Created: analyze_all.sh (run this to analyze all replicates)")
+    print(f"  Created: analyze_all.py (aggregates results)")
 
     # Save parameters
     params_file = output_dir / 'abfe_parameters.txt'
@@ -2444,6 +2687,7 @@ def main():
         f.write(f"  Complex leg: {n_complex} windows\n")
         f.write(f"  Solvent leg: {n_solvent} windows\n")
         f.write(f"  Total: {n_complex + n_solvent} windows\n")
+        f.write(f"  Replicates: {n_replicates}\n")
         if use_staged:
             stages = generate_stage_lambdas()
             f.write(f"\nStage-based schedule:\n")
@@ -2459,21 +2703,32 @@ def main():
     print(f"\nProtocol:")
     print(f"  FEP schedule: {args.fep_schedule}")
     print(f"  Restraint selection: {'MDRestraintsGenerator' if use_mdrestraints else 'Geometric'}")
-    print(f"  Total windows: {n_complex + n_solvent}")
+    print(f"  Total windows: {n_complex + n_solvent} per replicate")
+    print(f"  Replicates: {n_replicates}")
     print(f"\nOutput directory: {output_dir}")
+    print(f"\nDirectory structure:")
+    for rep in range(1, n_replicates + 1):
+        print(f"  {rep}/complex/  - complex leg simulations")
+        print(f"  {rep}/solvent/  - solvent leg simulations")
     print(f"\nTo run simulations:")
-    print(f"\n  HPC/SLURM (recommended):")
-    print(f"    cd {complex_dir} && ./submit.sh")
-    print(f"    cd {solvent_dir} && ./submit.sh")
+    print(f"\n  HPC/SLURM (submit all replicates):")
+    for rep in range(1, n_replicates + 1):
+        print(f"    cd {output_dir}/{rep}/complex && ./submit.sh")
+        print(f"    cd {output_dir}/{rep}/solvent && ./submit.sh")
     print(f"\n  This uses SLURM dependencies to ensure efficient resource usage:")
     print(f"    1. Window 0 jobs submit first (full equilibration)")
     print(f"    2. Branch jobs (windows 1-N) submit with --dependency on window 0")
     print(f"    3. Branch jobs won't start until window 0 completes")
-    print(f"\n  Check progress:")
-    print(f"    cd {complex_dir} && ./check_status.sh")
-    print(f"    cd {solvent_dir} && ./check_status.sh")
-    print(f"\nAfter completion, analyze with:")
-    print(f"  cd {output_dir} && ./analyze.sh")
+    print(f"\n  Check progress for each replicate:")
+    for rep in range(1, n_replicates + 1):
+        print(f"    cd {output_dir}/{rep}/complex && ./check_status.sh")
+    print(f"\nAfter completion, analyze all replicates with:")
+    print(f"  cd {output_dir} && ./analyze_all.sh")
+    print(f"\n  This will:")
+    print(f"    1. Run analysis for each replicate")
+    print(f"    2. Calculate mean and standard error across replicates")
+    print(f"    3. Output results in Biggin lab format:")
+    print(f"       ligand  ABFE_mean  ABFE_err  nreplicates")
     print(f"\n  (Uses alchemlyb/MBAR if installed, otherwise falls back to gmx bar)")
     print(f"  Install alchemlyb: pip install alchemlyb")
     print(f"\nBinding free energy:")

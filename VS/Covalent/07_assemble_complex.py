@@ -320,13 +320,20 @@ def assemble_covalent_complex(
                 # Write CYL residue (backbone from protein, ligand from mol2)
 
                 # CYS backbone atoms in order
-                backbone_order = ['N', 'H', 'CA', 'HA', 'CB', 'HB2', 'HB3', 'SG', 'C', 'O']
+                # NOTE: 'H' (amide hydrogen on N) is intentionally EXCLUDED here.
+                # The capped mol2 has N at a different position than the peptide backbone
+                # (because it's bonded to a cap, not the previous residue's C=O).
+                # Taking H from the mol2 would place it ~2Å away from the peptide N.
+                # Instead, we let pdb2gmx regenerate H based on proper backbone geometry.
+                # HA, HB2, HB3 are fine because CA/CB have same coords in both.
+                backbone_order = ['N', 'CA', 'HA', 'CB', 'HB2', 'HB3', 'SG', 'C', 'O']
 
                 # Get backbone heavy atoms from protein
                 cys_atoms = {atom['name']: atom for atom in complex_atoms
                             if atom['resseq'] == cys_resid and atom['resname'] in ('CYS', 'CYX')}
 
-                # Get backbone atoms from mol2 (for hydrogens H, HA, HB2, HB3)
+                # Get backbone atoms from mol2 (for hydrogens HA, HB2, HB3)
+                # H is excluded - will be built by pdb2gmx
                 mol2_backbone = {a['name']: a for a in mol2_atoms if a['name'] in backbone_order}
 
                 # Calculate translation from mol2 SG to protein SG

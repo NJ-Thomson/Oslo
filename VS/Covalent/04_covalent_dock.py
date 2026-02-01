@@ -27,7 +27,9 @@ Scoring (GNINA 1.3):
     covalent complexes - see McNutt et al. J Cheminform 2025)
   - Poses are ranked by Vina affinity (kcal/mol, more negative = better)
   - Geometry filters: distance to Cys-SG and C-SG-CB angle
+  - Optional H-bond filtering: prioritize poses with hinge region contacts
 """
+import re
 import argparse
 import subprocess
 import os
@@ -846,6 +848,172 @@ def run_gnina_covalent(receptor, ligand, output, center, box_size=18,
     return False
 
 
+# =============================================================================
+# H-bond screening functions (for hinge region filtering)
+# =============================================================================
+
+HBOND_DIST_MAX = 3.5  # Angstroms
+DONORS = {'N', 'O'}
+ACCEPTORS = {'N', 'O', 'F'}
+
+
+def parse_residue_spec(spec):
+    """Parse residue spec like 'M816' or 'E814' into (resname, resnum)."""
+    aa_map = {
+        'A': 'ALA', 'R': 'ARG', 'N': 'ASN', 'D': 'ASP', 'C': 'CYS',
+        'E': 'GLU', 'Q': 'GLN', 'G': 'GLY', 'H': 'HIS', 'I': 'ILE',
+        'L': 'LEU', 'K': 'LYS', 'M': 'MET', 'F': 'PHE', 'P': 'PRO',
+        'S': 'SER', 'T': 'THR', 'W': 'TRP', 'Y': 'TYR', 'V': 'VAL'
+    }
+    spec = spec.strip().upper()
+    match = re.match(r'([A-Z]+)(\d+)', spec)
+    if match:
+        res_name = match.group(1)
+        res_num = int(match.group(2))
+        if len(res_name) == 1 and res_name in aa_map:
+            res_name = aa_map[res_name]
+        return res_name, res_num
+    return None, None
+
+
+def parse_pdb_for_hbonds(pdb_file, residue_filter=None):
+    """Parse PDB atoms for H-bond analysis."""
+    atoms = []
+    with open(pdb_file) as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                atom_name = line[12:16].strip()
+                res_name = line[17:20].strip()
+                try:
+                    res_num = int(line[22:26])
+                except ValueError:
+                    continue
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                element = line[76:78].strip() if len(line) > 76 else atom_name[0]
+
+                if residue_filter and res_num not in residue_filter:
+                    continue
+
+                atoms.append({
+                    'name': atom_name,
+                    'resname': res_name,
+                    'resnum': res_num,
+                    'coords': np.array([x, y, z]),
+                    'element': element,
+                    'is_backbone': atom_name in ['N', 'CA', 'C', 'O', 'H', 'HN']
+                })
+    return atoms
+
+
+def get_ligand_atoms_for_hbonds(mol):
+    """Extract atom info from RDKit molecule for H-bond analysis."""
+    conf = mol.GetConformer()
+    atoms = []
+    for i, atom in enumerate(mol.GetAtoms()):
+        pos = conf.GetAtomPosition(i)
+        symbol = atom.GetSymbol()
+        atoms.append({
+            'idx': i,
+            'symbol': symbol,
+            'coords': np.array([pos.x, pos.y, pos.z]),
+            'is_donor': symbol in DONORS and atom.GetTotalNumHs() > 0,
+            'is_acceptor': symbol in ACCEPTORS
+        })
+    return atoms
+
+
+def calculate_hbonds(ligand_atoms, receptor_atoms):
+    """Calculate H-bonds between ligand and receptor."""
+    hbonds = []
+    for lig_atom in ligand_atoms:
+        for rec_atom in receptor_atoms:
+            dist = np.linalg.norm(lig_atom['coords'] - rec_atom['coords'])
+            if dist > HBOND_DIST_MAX:
+                continue
+
+            rec_element = rec_atom['element'].upper()
+            is_rec_donor = rec_element in DONORS
+            is_rec_acceptor = rec_element in ACCEPTORS
+
+            if lig_atom['is_donor'] and is_rec_acceptor:
+                hbonds.append({
+                    'lig_atom': lig_atom['symbol'],
+                    'rec_atom': rec_atom['name'],
+                    'rec_resname': rec_atom['resname'],
+                    'rec_resnum': rec_atom['resnum'],
+                    'distance': dist
+                })
+            if lig_atom['is_acceptor'] and is_rec_donor:
+                hbonds.append({
+                    'lig_atom': lig_atom['symbol'],
+                    'rec_atom': rec_atom['name'],
+                    'rec_resname': rec_atom['resname'],
+                    'rec_resnum': rec_atom['resnum'],
+                    'distance': dist
+                })
+    return hbonds
+
+
+def screen_poses_for_hinge_contacts(poses, receptor_pdb, required_residues, min_required=1):
+    """
+    Screen poses for H-bonds to required residues (hinge region).
+
+    Args:
+        poses: List of pose dicts from filter_poses_by_geometry
+        receptor_pdb: Path to receptor PDB
+        required_residues: List of residue specs like ['E814', 'Y815', 'M816', 'D819']
+        min_required: Minimum number of residues with H-bond contacts
+
+    Returns:
+        poses list augmented with hinge contact info, re-sorted to prioritize hinge contacts
+    """
+    # Parse required residues
+    required_resnums = set()
+    for spec in required_residues:
+        _, resnum = parse_residue_spec(spec)
+        if resnum:
+            required_resnums.add(resnum)
+
+    if not required_resnums:
+        return poses
+
+    # Parse receptor atoms in required residues
+    receptor_atoms = parse_pdb_for_hbonds(receptor_pdb, residue_filter=required_resnums)
+
+    if not receptor_atoms:
+        print(f"    Warning: No atoms found for hinge residues {required_residues}")
+        return poses
+
+    # Analyze each pose
+    for pose in poses:
+        mol = pose['mol']
+        lig_atoms = get_ligand_atoms_for_hbonds(mol)
+        hbonds = calculate_hbonds(lig_atoms, receptor_atoms)
+
+        # Find contacted hinge residues
+        contacted = set()
+        for hb in hbonds:
+            if hb['rec_resnum'] in required_resnums:
+                contacted.add(f"{hb['rec_resname']}{hb['rec_resnum']}")
+
+        pose['hinge_contacts'] = len(contacted)
+        pose['hinge_residues'] = list(contacted)
+        pose['passes_hinge'] = len(contacted) >= min_required
+
+    # Re-sort: prioritize poses with hinge contacts, then by affinity
+    # Sort key: (not passes_hinge, -hinge_contacts, vina_affinity, beta_dist)
+    poses.sort(key=lambda x: (
+        not x.get('passes_hinge', False),  # Passing poses first
+        -x.get('hinge_contacts', 0),        # More contacts better
+        x['vina_affinity'],                  # Better affinity
+        x['beta_dist']                       # Closer to SG
+    ))
+
+    return poses
+
+
 # ---------- Pose filtering ----------
 def find_beta_idx_in_pose_saturated(mol, target_sg_pos):
     conf = mol.GetConformer()
@@ -1075,6 +1243,11 @@ Examples:
     parser.add_argument('--ph', type=float, default=7.4)
     parser.add_argument('--keep_hets', action='store_true')
     parser.add_argument('--prot_method', choices=['reduce', 'pdbfixer'], default='reduce')
+    # Hinge region filtering
+    parser.add_argument('--prioritise_hbonds',
+                        help='Comma-separated hinge residues to prioritise H-bonds (e.g., E814,Y815,M816,D819)')
+    parser.add_argument('--min_hinge_contacts', type=int, default=1,
+                        help='Minimum number of hinge residues with H-bond contacts (default: 1)')
     args = parser.parse_args()
 
     print("=" * 70)
@@ -1264,6 +1437,30 @@ Examples:
         }]
 
     print(f"    Found {len(good_poses)} valid poses (post-filtering).")
+
+    # Step 7b: Hinge region H-bond filtering (if requested)
+    if args.prioritise_hbonds and good_poses:
+        print("\n[7b] Hinge region H-bond screening...")
+        hinge_residues = [r.strip() for r in args.prioritise_hbonds.split(',')]
+        print(f"    Prioritising contacts to: {', '.join(hinge_residues)}")
+        print(f"    Minimum required contacts: {args.min_hinge_contacts}")
+
+        good_poses = screen_poses_for_hinge_contacts(
+            good_poses,
+            receptor_for_docking,
+            hinge_residues,
+            min_required=args.min_hinge_contacts
+        )
+
+        # Report hinge contact statistics
+        n_passing = sum(1 for p in good_poses if p.get('passes_hinge', False))
+        print(f"    Poses with >= {args.min_hinge_contacts} hinge contacts: {n_passing}/{len(good_poses)}")
+
+        if good_poses:
+            top_pose = good_poses[0]
+            if top_pose.get('hinge_residues'):
+                print(f"    Best pose hinge contacts: {', '.join(top_pose['hinge_residues'])}")
+
     best = good_poses[0]
     best_sdf = str(outdir / "best_pose.sdf")
     write_sdf_v3000(best['mol'], best_sdf)
@@ -1273,6 +1470,8 @@ Examples:
     print(f"      - Distance to SG: {best.get('beta_dist', 0.0):.2f} Å")
     if best.get('angle') is not None:
         print(f"      - C-SG-CB angle: {best['angle']:.1f}°")
+    if best.get('hinge_contacts') is not None:
+        print(f"      - Hinge contacts: {best['hinge_contacts']} ({', '.join(best.get('hinge_residues', []))})")
 
     print("\n[8] Writing complex PDB...")
     complex_pdb = str(outdir / "complex.pdb")

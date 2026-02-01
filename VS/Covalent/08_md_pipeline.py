@@ -38,8 +38,12 @@ from pathlib import Path
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
-from b04_extract_adduct_fragment import build_optimized_fragment
-from b06_assemble_covalent_complex import assemble_covalent_complex
+# Handle imports with numeric prefixes
+import importlib
+_extract = importlib.import_module("05_extract_adduct")
+build_optimized_fragment = _extract.build_optimized_fragment
+_assemble = importlib.import_module("07_assemble_complex")
+assemble_covalent_complex = _assemble.assemble_covalent_complex
 
 
 def run_cmd(cmd, cwd=None, check=True, env=None, capture=False):
@@ -74,29 +78,78 @@ def run_python_script(script_path, args, cwd=None):
     return run_cmd(cmd, cwd=cwd)
 
 
-def run_acpype(mol2_file, output_dir, net_charge=0):
-    """Run acpype to parameterize the adduct."""
-    print(f"\n  Running acpype on {mol2_file.name}...")
+def run_acpype(mol2_file, output_dir, net_charge=0, charge_method='bcc', timeout=180, 
+               gasteiger_fallback=True):
+    """Run acpype to parameterize the adduct.
+    
+    Args:
+        mol2_file: Input mol2 file
+        output_dir: Output directory for acpype results
+        net_charge: Net charge of the molecule
+        charge_method: Charge method ('bcc' for AM1-BCC, 'gas' for Gasteiger)
+        timeout: Timeout in seconds for AM1-BCC (default: 180s = 3 min)
+        gasteiger_fallback: If True, fallback to Gasteiger if BCC times out
+    
+    Returns:
+        Tuple of (acpype_dir, charge_method_used)
+    """
+    print(f"\n  Running acpype on {mol2_file.name} (charge method: {charge_method})...")
 
     # acpype needs the file in current directory or absolute path
     mol2_abs = mol2_file.resolve()
-
-    # Run acpype
-    cmd = f"acpype -i {mol2_abs} -c bcc -n {net_charge} -a gaff2"
-    result = run_cmd(cmd, cwd=output_dir, check=False)
-
-    # Find the output directory (acpype creates MOL.acpype/)
     stem = mol2_file.stem
-    acpype_dir = output_dir / f"{stem}.acpype"
+    
+    # Clean up any previous acpype output
+    old_acpype = output_dir / f"{stem}.acpype"
+    if old_acpype.exists():
+        shutil.rmtree(old_acpype)
 
+    # Run acpype with specified charge method
+    cmd = f"acpype -i {mol2_abs} -c {charge_method} -n {net_charge} -a gaff2"
+    
+    try:
+        result = subprocess.run(
+            cmd, shell=True, cwd=output_dir,
+            capture_output=True, text=True,
+            timeout=timeout if charge_method == 'bcc' else None,
+            executable='/bin/bash'
+        )
+        success = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        print(f"    TIMEOUT: AM1-BCC took longer than {timeout}s")
+        success = False
+        # Kill any lingering sqm processes
+        subprocess.run("pkill -9 -f sqm", shell=True, capture_output=True)
+    
+    # Find the output directory
+    acpype_dir = output_dir / f"{stem}.acpype"
     if not acpype_dir.exists():
-        # Try alternate naming
         for d in output_dir.iterdir():
             if d.is_dir() and d.name.endswith('.acpype'):
                 acpype_dir = d
                 break
-
-    return acpype_dir
+    
+    # Check if parameterization succeeded
+    gmx_itp = acpype_dir / f"{stem}_GMX.itp" if acpype_dir.exists() else None
+    if gmx_itp and gmx_itp.exists():
+        print(f"    ✓ Parameterization succeeded with {charge_method.upper()} charges")
+        return acpype_dir, charge_method
+    
+    # Fallback to Gasteiger if BCC failed and fallback is enabled
+    if charge_method == 'bcc' and gasteiger_fallback:
+        print(f"    Falling back to Gasteiger charges...")
+        
+        # Clean up failed BCC attempt
+        if acpype_dir.exists():
+            shutil.rmtree(acpype_dir)
+        # Also clean up any temp files
+        for tmp in output_dir.glob(".acpype_tmp*"):
+            shutil.rmtree(tmp, ignore_errors=True)
+        
+        return run_acpype(mol2_file, output_dir, net_charge, 
+                         charge_method='gas', timeout=None, gasteiger_fallback=False)
+    
+    return acpype_dir, charge_method
 
 
 def get_gaff2_mass_from_typename(typename):
@@ -468,21 +521,30 @@ def deduplicate(items, n_key_fields):
 
 
 def deduplicate_dihedrals(dihedrals):
-    """Remove duplicate dihedrals based on atom types AND periodicity (pn).
+    """Remove duplicate dihedrals - keep only ONE entry per atom type combo.
 
-    For dihedral type 9 (Ryckaert-Bellemans), the same atom types can have
-    multiple terms with different periodicities, so we need to include pn
-    in the key.
+    GROMACS 2025 doesn't support multiple lines with different periodicities
+    for the same atom types in [ dihedraltypes ]. We keep only the term with
+    the largest force constant (most important contribution).
+
+    For proper MD, a single dominant Fourier term is usually sufficient.
     """
-    seen = set()
-    unique = []
+    # Group by atom types
+    dihedral_groups = {}
     for d in dihedrals:
         # d = (ti, tj, tk, tl, funct, phase, kd, pn)
-        # Key includes atom types and periodicity
-        key = (d[0], d[1], d[2], d[3], d[7])  # (i, j, k, l, pn)
-        if key not in seen:
-            seen.add(key)
-            unique.append(d)
+        key = (d[0], d[1], d[2], d[3])  # Just atom types
+        if key not in dihedral_groups:
+            dihedral_groups[key] = []
+        dihedral_groups[key].append(d)
+
+    # For each group, keep the term with the largest force constant
+    unique = []
+    for key, group in dihedral_groups.items():
+        # Sort by absolute force constant (kd at index 6), keep largest
+        best = max(group, key=lambda x: abs(x[6]))
+        unique.append(best)
+
     return unique
 
 
@@ -741,6 +803,14 @@ Use --cyl-resname to specify unique names (CX1, CX2, C32, etc.) for RBFE.
                         help='Skip extraction (use existing params/adduct.mol2)')
     parser.add_argument('--skip-param', action='store_true',
                         help='Skip parameterization (use existing acpype output)')
+    parser.add_argument('--charge-method', choices=['bcc', 'gas'], default='bcc',
+                        help='Charge method: bcc (AM1-BCC, slower but more accurate) or '
+                             'gas (Gasteiger, fast empirical). Default: bcc')
+    parser.add_argument('--bcc-timeout', type=int, default=180,
+                        help='Timeout in seconds for AM1-BCC parameterization (default: 180). '
+                             'If exceeded, falls back to Gasteiger.')
+    parser.add_argument('--no-gasteiger-fallback', action='store_true',
+                        help='Disable automatic fallback to Gasteiger if AM1-BCC fails/times out')
 
     args = parser.parse_args()
 
@@ -778,6 +848,7 @@ Use --cyl-resname to specify unique names (CX1, CX2, C32, etc.) for RBFE.
     print(f"Output dir:     {output_dir}")
     print(f"Cap type:       {args.cap_type}")
     print(f"Net charge:     {args.net_charge}")
+    print(f"Charge method:  {args.charge_method} (timeout: {args.bcc_timeout}s)")
     print(f"GROMACS:        {args.gmx}")
 
     # Verify input exists
@@ -866,29 +937,47 @@ Use --cyl-resname to specify unique names (CX1, CX2, C32, etc.) for RBFE.
     # Check for existing acpype output
     acpype_dir = params_dir / "adduct_merged.acpype"
 
-    # acpype output files:
-    #   - adduct_merged_bcc_gaff2.mol2 (parameterized mol2 with GAFF2 types)
+    # acpype output files (naming depends on charge method):
+    #   - adduct_merged_bcc_gaff2.mol2 or adduct_merged_gas_gaff2.mol2
     #   - adduct_merged_GMX.itp (GROMACS include topology with bonded params)
     #   - adduct_merged_GMX.top (GROMACS master topology)
-    gmx_mol2 = acpype_dir / "adduct_merged_bcc_gaff2.mol2" if acpype_dir.exists() else None
-    gmx_itp = acpype_dir / "adduct_merged_GMX.itp" if acpype_dir.exists() else None
+    gmx_mol2 = None
+    gmx_itp = None
+    charge_method_used = args.charge_method
+    
+    if acpype_dir.exists():
+        for f in acpype_dir.iterdir():
+            if f.name.endswith('_gaff2.mol2'):
+                gmx_mol2 = f
+            elif f.name.endswith('_GMX.itp'):
+                gmx_itp = f
 
     if args.skip_param and acpype_dir.exists() and gmx_mol2 and gmx_mol2.exists():
         print(f"  Skipping parameterization, using existing: {acpype_dir}")
     else:
-        acpype_dir = run_acpype(adduct_merged, params_dir, net_charge=args.net_charge)
+        acpype_dir, charge_method_used = run_acpype(
+            adduct_merged, params_dir, 
+            net_charge=args.net_charge,
+            charge_method=args.charge_method,
+            timeout=args.bcc_timeout,
+            gasteiger_fallback=not args.no_gasteiger_fallback
+        )
 
         if acpype_dir and acpype_dir.exists():
             # Find output files - acpype naming convention
+            gmx_mol2 = None
+            gmx_itp = None
             for f in acpype_dir.iterdir():
-                if f.name.endswith('_bcc_gaff2.mol2'):
+                if f.name.endswith('_gaff2.mol2'):  # Works for both bcc and gas
                     gmx_mol2 = f
                 elif f.name.endswith('_GMX.itp'):
                     gmx_itp = f
+    
+    if charge_method_used != args.charge_method:
+        print(f"  Note: Used {charge_method_used.upper()} charges (fallback from {args.charge_method.upper()})")
 
     if not gmx_mol2 or not gmx_mol2.exists():
         print(f"ERROR: acpype did not create parameterized mol2")
-        print(f"  Expected: {acpype_dir / 'adduct_merged_bcc_gaff2.mol2'}")
         if acpype_dir and acpype_dir.exists():
             print(f"  Available files: {[f.name for f in acpype_dir.iterdir()]}")
         return 1
@@ -986,6 +1075,10 @@ Use --cyl-resname to specify unique names (CX1, CX2, C32, etc.) for RBFE.
     print(f"  GMXLIB={gmxlib_path}")
 
     ff_basename = f"amber99sb-ildn-{cyl_resname.lower()}"
+    # Don't use -ignh: it would ignore ALL hydrogens and try to rebuild from .hdb,
+    # but ligand hydrogens aren't in .hdb. Instead, b06 now correctly omits only
+    # the backbone amide H (which has wrong coords from capped mol2), and pdb2gmx
+    # will build it correctly. All other hydrogens are kept from the input PDB.
     run_cmd(
         f"{gmx} pdb2gmx -f {complex_cyl} -o {gro_file} -p {top_file} "
         f"-ff {ff_basename} -water tip3p",
@@ -1046,10 +1139,10 @@ pbc         = xyz
         env=gmx_env
     )
 
-    # Add ions to neutralize
+    # Add ions to neutralize and add 150 mM NaCl ionic strength
     run_cmd(
         f"echo 'SOL' | {gmx} genion -s {ions_tpr} -o {ions_gro} -p {top_file} "
-        f"-pname NA -nname CL -neutral",
+        f"-pname NA -nname CL -neutral -conc 0.15",
         cwd=md_dir,
         env=gmx_env
     )
