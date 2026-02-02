@@ -2,6 +2,10 @@
 VS/Inputs/
 VS/Outputs/
 
+# Sensitive config files
+VS/QM_MM/config.yaml
+VS/QM_MM/README.md
+
 # Python
 __pycache__/
 *.py[cod]
