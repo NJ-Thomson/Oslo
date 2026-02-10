@@ -1,0 +1,38 @@
+{
+    "Snakemake_job": {
+        "queue_submission_cmd": "sbatch",
+        "queue_abort_cmd": "scancel",
+        "queue_status_script": "abfe_slurm_status",
+        "queue_dependency": {
+            "key": "dependency",
+            "value": "afterok",
+            "sep": ":"
+        },
+        "queue_job_options": {
+            "partition": "small-g",
+            "time": "72:00:00",
+            "mem": "50G",
+            "cpus-per-task": 7,
+            "account": "YOUR_PROJECT_ACCOUNT",
+            "gpus-per-node": 1
+        }
+    },
+    "Sub_job": {
+        "queue_submission_cmd": "sbatch",
+        "queue_abort_cmd": "scancel",
+        "queue_status_script": "abfe_slurm_status",
+        "queue_dependency": {
+            "key": "dependency",
+            "value": "afterok",
+            "sep": ":"
+        },
+        "queue_job_options": {
+            "partition": "small-g",
+            "time": "72:00:00",
+            "mem": "50G",
+            "cpus-per-task": 7,
+            "account": "YOUR_PROJECT_ACCOUNT",
+            "gpus-per-node": 1
+        }
+    }
+}

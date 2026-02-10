@@ -1,0 +1,17 @@
+import abfe
+
+approach_path = config["out_approach_path"]
+
+# System Generation
+include: 'build_ligand_systems.smk'
+
+# run Simulations:
+include: 'simulations.smk'
+
+# Gather Results
+include: 'post_commands.smk'
+
+
+rule final_result:
+    input:
+        result=approach_path+"/abfe_results.tsv"
